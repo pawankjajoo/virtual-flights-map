@@ -1,0 +1,1207 @@
+#!/usr/bin/env python3
+"""
+PSS Tools Updater — Adaptive CDN & API Endpoint Checker
+========================================================
+Scrapling-inspired adaptive checker for PSS Virtual Flight Map and ROI Tool.
+Uses a 3-tier escalating fetch strategy (stealth HTTP → cloudscraper → Playwright)
+to validate and update CDN library versions and API endpoint health.
+
+Usage:
+  python pss_tools_updater.py                              # check all files
+  python pss_tools_updater.py --only map                   # only Flight Map
+  python pss_tools_updater.py --only roi                   # only ROI Tool
+  python pss_tools_updater.py --dry-run                    # report only, no writes
+  python pss_tools_updater.py --headless                   # force Playwright for all
+  python pss_tools_updater.py --no-headless                # HTTP only, skip Playwright
+  python pss_tools_updater.py --update-cdns                # update CDN URLs to latest
+  python pss_tools_updater.py --check-apis                 # validate API endpoints
+"""
+
+import re, os, sys, json, time, hashlib, argparse, logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOOTSTRAP — auto-install missing packages
+# ═══════════════════════════════════════════════════════════════════════════════
+def ensure_deps():
+    missing = []
+    for mod in ('requests', 'bs4', 'cloudscraper'):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append('beautifulsoup4' if mod == 'bs4' else mod)
+    if missing:
+        import subprocess
+        subprocess.check_call([
+            sys.executable, '-m', 'pip', 'install', *missing,
+            '--break-system-packages', '-q'
+        ])
+
+ensure_deps()
+
+import requests
+from bs4 import BeautifulSoup
+try:
+    import cloudscraper
+except ImportError:
+    cloudscraper = None
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+log = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PLAYWRIGHT BOOTSTRAP
+# ═══════════════════════════════════════════════════════════════════════════════
+def ensure_playwright():
+    """Lazy-install playwright + chromium if needed. Returns True on success."""
+    try:
+        from playwright.sync_api import sync_playwright  # noqa
+        return True
+    except ImportError:
+        pass
+    try:
+        import subprocess
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install',
+                               'playwright', '--break-system-packages', '-q'])
+        subprocess.check_call([sys.executable, '-m', 'playwright', 'install',
+                               'chromium', '--with-deps'])
+        return True
+    except Exception as e:
+        log.warning(f'  [PW] Playwright install failed: {e}')
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE FETCHER — 3-tier escalating strategy
+# ═══════════════════════════════════════════════════════════════════════════════
+class AdaptiveFetcher:
+    """
+    Tier 1: Stealth HTTP (requests with realistic headers)
+    Tier 2: Cloudflare bypass (cloudscraper)
+    Tier 3: Headless Chromium (Playwright) for JS-rendered pages
+    """
+
+    STEALTH_HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+
+    def __init__(self, use_playwright='auto'):
+        self._pw = None
+        self._pw_browser = None
+        self._pw_mode = use_playwright  # 'auto', 'always', 'never'
+
+    def fetch(self, url, timeout=15, js_render=False):
+        """Fetch URL with escalating strategies. Returns (html, status_code)."""
+        skip_pw = self._pw_mode == 'never'
+        force_pw = self._pw_mode == 'always' or js_render
+
+        if force_pw and not skip_pw:
+            try:
+                return self._try_playwright(url, timeout)
+            except Exception as e:
+                log.warning(f'  [PW] Playwright failed: {e}')
+
+        # Tier 1: stealth HTTP
+        try:
+            r = requests.get(url, headers=self.STEALTH_HEADERS, timeout=timeout,
+                             allow_redirects=True)
+            if r.status_code == 200:
+                html = r.text
+                if not skip_pw and self._is_js_shell(html):
+                    log.info(f'  [T1] JS shell detected, escalating to Playwright')
+                    try:
+                        return self._try_playwright(url, timeout)
+                    except Exception as e:
+                        log.warning(f'  [PW] Playwright failed: {e}')
+                return html, r.status_code
+            elif r.status_code == 403:
+                log.info(f'  [T1] 403 — escalating to cloudscraper')
+            else:
+                return r.text, r.status_code
+        except Exception as e:
+            log.warning(f'  [T1] HTTP failed: {e}')
+
+        # Tier 2: cloudscraper
+        if cloudscraper:
+            try:
+                scraper = cloudscraper.create_scraper(
+                    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+                )
+                r = scraper.get(url, timeout=timeout)
+                if r.status_code == 200:
+                    html = r.text
+                    if not skip_pw and self._is_js_shell(html):
+                        log.info(f'  [T2] JS shell detected, escalating to Playwright')
+                        try:
+                            return self._try_playwright(url, timeout)
+                        except Exception as e:
+                            log.warning(f'  [PW] Playwright failed: {e}')
+                    return html, r.status_code
+            except Exception as e:
+                log.warning(f'  [T2] Cloudscraper failed: {e}')
+
+        # Tier 3: Playwright
+        if not skip_pw:
+            try:
+                return self._try_playwright(url, timeout)
+            except Exception as e:
+                log.warning(f'  [T3] Playwright failed: {e}')
+
+        return '', 0
+
+    def fetch_json(self, url, timeout=15):
+        """Fetch a JSON API endpoint. Returns (data_dict, status_code)."""
+        try:
+            r = requests.get(url, headers={
+                **self.STEALTH_HEADERS,
+                'Accept': 'application/json, */*'
+            }, timeout=timeout, allow_redirects=True)
+            if r.status_code == 200:
+                return r.json(), 200
+            return None, r.status_code
+        except Exception as e:
+            log.warning(f'  [API] JSON fetch failed: {e}')
+            return None, 0
+
+    def _try_playwright(self, url, timeout):
+        self._ensure_pw()
+        if not self._pw_browser:
+            raise RuntimeError('Playwright browser not available')
+
+        context = self._pw_browser.new_context(
+            user_agent=self.STEALTH_HEADERS['User-Agent'],
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
+            timezone_id='America/New_York',
+            java_script_enabled=True,
+            bypass_csp=True,
+        )
+        page = context.new_page()
+        # Block heavy resources
+        def route_handler(route):
+            blocked = ('image', 'media', 'font')
+            if route.request.resource_type in blocked:
+                route.abort()
+            else:
+                route.continue_()
+        page.route('**/*', route_handler)
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=timeout * 1000)
+            page.wait_for_load_state('networkidle', timeout=8000)
+            page.wait_for_timeout(2000)
+            html = page.content()
+        finally:
+            context.close()
+        return html, 200
+
+    def _ensure_pw(self):
+        if self._pw_browser:
+            return
+        if not ensure_playwright():
+            return
+        try:
+            from playwright.sync_api import sync_playwright
+            self._pw = sync_playwright().start()
+            self._pw_browser = self._pw.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                ]
+            )
+        except Exception as e:
+            log.warning(f'  [PW] Browser launch failed: {e}')
+
+    @staticmethod
+    def _is_js_shell(html):
+        """Detect if HTML is just a JS-framework shell with no real content."""
+        if not html or len(html) < 100:
+            return True
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            body = soup.find('body')
+            if not body:
+                return True
+            for tag in body.find_all(['script', 'style', 'noscript', 'link']):
+                tag.decompose()
+            visible = body.get_text(strip=True)
+            if len(visible) < 200:
+                return True
+            # SPA indicators
+            spa_markers = ['enable javascript', 'requires javascript',
+                           'loading...', 'please wait', '__next', '__nuxt']
+            lower = html[:3000].lower()
+            if sum(1 for m in spa_markers if m in lower) >= 2:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def close(self):
+        if self._pw_browser:
+            try:
+                self._pw_browser.close()
+            except Exception:
+                pass
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE CDN VERSION PARSER
+# ═══════════════════════════════════════════════════════════════════════════════
+class CDNVersionChecker:
+    """
+    Multi-strategy CDN library version checker.
+    Checks cdnjs, npm registry, GitHub releases for the latest version of a library.
+    """
+
+    # Known CDN libraries used across the PSS tools
+    CDN_LIBS = {
+        'leaflet': {
+            'npm_package': 'leaflet',
+            'cdnjs_name': 'leaflet',
+            'github': 'Leaflet/Leaflet',
+            'current_pattern': r'cdnjs\.cloudflare\.com/ajax/libs/leaflet/([\d.]+)/',
+            'url_template': 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/{version}/{file}',
+            'files': ['leaflet.min.css', 'leaflet.min.js'],
+        },
+        'chart.js': {
+            'npm_package': 'chart.js',
+            'cdnjs_name': 'Chart.js',
+            'github': 'chartjs/Chart.js',
+            'current_pattern': r'cdnjs\.cloudflare\.com/ajax/libs/Chart\.js/([\d.]+)/',
+            'url_template': 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/{version}/{file}',
+            'files': ['chart.umd.min.js'],
+        },
+        'html2canvas': {
+            'npm_package': 'html2canvas',
+            'cdnjs_name': 'html2canvas',
+            'github': 'niklasvh/html2canvas',
+            'current_pattern': r'cdnjs\.cloudflare\.com/ajax/libs/html2canvas/([\d.]+)/',
+            'url_template': 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/{version}/{file}',
+            'files': ['html2canvas.min.js'],
+        },
+        'jspdf': {
+            'npm_package': 'jspdf',
+            'cdnjs_name': 'jspdf',
+            'github': 'parallax/jsPDF',
+            'current_pattern': r'cdnjs\.cloudflare\.com/ajax/libs/jspdf/([\d.]+)/',
+            'url_template': 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/{version}/{file}',
+            'files': ['jspdf.umd.min.js'],
+        },
+    }
+
+    VERSION_RE = re.compile(r'(\d+\.\d+(?:\.\d+)?)')
+
+    def __init__(self, fetcher):
+        self.fetcher = fetcher
+
+    def check_latest(self, lib_name):
+        """
+        Check the latest version of a CDN library using multiple strategies.
+        Returns (version_str, confidence, source) or (None, 0, None).
+        """
+        lib = self.CDN_LIBS.get(lib_name)
+        if not lib:
+            return None, 0, None
+
+        candidates = []
+
+        # Strategy 1: cdnjs API (most reliable for CDN libs)
+        try:
+            data, status = self.fetcher.fetch_json(
+                f"https://api.cdnjs.com/libraries/{lib['cdnjs_name']}?fields=version"
+            )
+            if data and 'version' in data:
+                candidates.append((data['version'], 0.95, 'cdnjs-api'))
+        except Exception as e:
+            log.debug(f'  [CDN] cdnjs API failed for {lib_name}: {e}')
+
+        # Strategy 2: npm registry
+        try:
+            data, status = self.fetcher.fetch_json(
+                f"https://registry.npmjs.org/{lib['npm_package']}/latest"
+            )
+            if data and 'version' in data:
+                candidates.append((data['version'], 0.90, 'npm-registry'))
+        except Exception as e:
+            log.debug(f'  [CDN] npm registry failed for {lib_name}: {e}')
+
+        # Strategy 3: GitHub releases API
+        if 'github' in lib:
+            try:
+                data, status = self.fetcher.fetch_json(
+                    f"https://api.github.com/repos/{lib['github']}/releases/latest"
+                )
+                if data and 'tag_name' in data:
+                    m = self.VERSION_RE.search(data['tag_name'])
+                    if m:
+                        candidates.append((m.group(1), 0.85, 'github-releases'))
+            except Exception as e:
+                log.debug(f'  [CDN] GitHub API failed for {lib_name}: {e}')
+
+        # Strategy 4: Scrape cdnjs page (adaptive — works even if API changes)
+        try:
+            html, status = self.fetcher.fetch(
+                f"https://cdnjs.com/libraries/{lib['cdnjs_name']}", timeout=10
+            )
+            if html:
+                # Look for version in page content
+                patterns = [
+                    rf'{lib["cdnjs_name"]}[/\s@v]+([\d]+\.[\d]+(?:\.[\d]+)?)',
+                    r'Current version[:\s]*([\d]+\.[\d]+(?:\.[\d]+)?)',
+                    r'"version"\s*:\s*"([\d]+\.[\d]+(?:\.[\d]+)?)"',
+                ]
+                for pat in patterns:
+                    m = re.search(pat, html, re.IGNORECASE)
+                    if m:
+                        candidates.append((m.group(1), 0.70, 'cdnjs-scrape'))
+                        break
+        except Exception as e:
+            log.debug(f'  [CDN] cdnjs scrape failed for {lib_name}: {e}')
+
+        if not candidates:
+            return None, 0, None
+
+        # Pick highest confidence
+        candidates.sort(key=lambda x: (-x[1], x[0]))
+        return candidates[0]
+
+    def get_current_version(self, html_content, lib_name):
+        """Extract the current CDN version from the HTML file."""
+        lib = self.CDN_LIBS.get(lib_name)
+        if not lib:
+            return None
+        m = re.search(lib['current_pattern'], html_content)
+        return m.group(1) if m else None
+
+    def build_updated_urls(self, lib_name, new_version):
+        """Build the new CDN URLs for a given library version."""
+        lib = self.CDN_LIBS.get(lib_name)
+        if not lib:
+            return {}
+        urls = {}
+        for f in lib['files']:
+            urls[f] = lib['url_template'].format(version=new_version, file=f)
+        return urls
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# API ENDPOINT HEALTH CHECKER
+# ═══════════════════════════════════════════════════════════════════════════════
+class APIHealthChecker:
+    """Validates API endpoints used in the Flight Map are alive and responding."""
+
+    # All API endpoints used in the Flight Map — updated to match latest HTML
+    ENDPOINTS = {
+        'vatsim_data': {
+            'url': 'https://data.vatsim.net/v3/vatsim-data.json',
+            'type': 'json',
+            'critical': True,
+            'validate': lambda d: 'pilots' in d and 'controllers' in d,
+            'description': 'VATSIM live pilot/ATC data',
+        },
+        'vatsim_transceivers': {
+            'url': 'https://data.vatsim.net/v3/transceivers-data.json',
+            'type': 'json',
+            'critical': True,
+            'validate': lambda d: isinstance(d, list),
+            'description': 'VATSIM radio transceiver data',
+        },
+        'ivao_whazzup': {
+            'url': 'https://api.ivao.aero/v2/tracker/whazzup',
+            'type': 'json',
+            'critical': False,
+            'validate': lambda d: 'clients' in d or 'pilots' in d or isinstance(d, dict),
+            'description': 'IVAO live tracker data (multi-network)',
+        },
+        'poscon_online': {
+            'url': 'https://hqapi.poscon.net/online.json',
+            'type': 'json',
+            'critical': False,
+            'validate': lambda d: isinstance(d, (dict, list)),
+            'description': 'POSCON online data (multi-network)',
+        },
+        'vatsim_airports': {
+            'url': 'https://api.vatsim.net/api/airports/?search=KJFK&limit=1',
+            'type': 'json',
+            'critical': False,
+            'validate': lambda d: 'results' in d or isinstance(d, list),
+            'description': 'VATSIM airport search API',
+        },
+        'vatspy_boundaries': {
+            'url': 'https://raw.githubusercontent.com/vatsimnetwork/vatspy-data-project/master/Boundaries.geojson',
+            'type': 'json',
+            'critical': False,
+            'validate': lambda d: d.get('type') in ('FeatureCollection', 'Feature') or 'features' in d,
+            'description': 'VATSpy FIR/UIR boundary data',
+        },
+        'awc_sigmet': {
+            'url': 'https://aviationweather.gov/api/data/sigmet?hazard=ALL&format=geojson',
+            'type': 'json',
+            'critical': False,
+            'validate': lambda d: isinstance(d, dict),
+            'description': 'NOAA SIGMET data (GeoJSON)',
+        },
+        'awc_metar': {
+            'url': 'https://aviationweather.gov/api/data/metar?bbox=-180,-90,180,90&format=json&hours=2',
+            'type': 'json',
+            'critical': False,
+            'validate': lambda d: isinstance(d, list) and len(d) > 0,
+            'description': 'NOAA METAR data (JSON)',
+        },
+        'awc_metar_csv': {
+            'url': (
+                'https://aviationweather.gov/cgi-bin/data/metar.php'
+                '?dataType=METAR&requestType=retrieve&format=csv&hoursBeforeNow=2'
+                '&mostRecent=false&mostRecentForEachStation=constraint'
+                '&minDeg=-90&maxDeg=90&minLon=-180&maxLon=180'
+                '&fields=icaoId,lat,lon,temp,dewp,wdir,wspd,wgst,visib,altim,wxString,rawOb,fltcat,clouds'
+            ),
+            'type': 'text',
+            'critical': False,
+            'validate': lambda d: len(d) > 100,
+            'description': 'NOAA METAR fallback (CSV with fltcat+clouds fields)',
+        },
+        'rainviewer': {
+            'url': 'https://api.rainviewer.com/public/weather-maps.json',
+            'type': 'json',
+            'critical': False,
+            'validate': lambda d: 'radar' in d or 'host' in d,
+            'description': 'RainViewer weather radar tiles',
+        },
+        'carto_tiles': {
+            'url': 'https://a.basemaps.cartocdn.com/dark_all/0/0/0.png',
+            'type': 'binary',
+            'critical': True,
+            'validate': lambda d: len(d) > 100,
+            'description': 'CARTO dark basemap tiles',
+        },
+        'cors_proxy': {
+            'url': 'https://misty-haze-c02d.pushstartsims-com.workers.dev/?url='
+                   + 'https%3A%2F%2Fdata.vatsim.net%2Fv3%2Fvatsim-data.json',
+            'type': 'json',
+            'critical': True,
+            'validate': lambda d: 'pilots' in d and 'controllers' in d,
+            'description': 'PSS CORS proxy worker (Cloudflare Worker)',
+        },
+    }
+
+    def __init__(self, fetcher):
+        self.fetcher = fetcher
+
+    def check_endpoint(self, name):
+        """
+        Check a single API endpoint. Returns dict with:
+        {name, url, status, ok, latency_ms, error, description}
+        """
+        ep = self.ENDPOINTS.get(name)
+        if not ep:
+            return {'name': name, 'ok': False, 'error': 'Unknown endpoint'}
+
+        result = {
+            'name': name,
+            'url': ep['url'],
+            'description': ep['description'],
+            'critical': ep['critical'],
+            'ok': False,
+            'status': 0,
+            'latency_ms': 0,
+            'error': None,
+        }
+
+        start = time.time()
+        try:
+            if ep['type'] == 'json':
+                data, status = self.fetcher.fetch_json(ep['url'], timeout=12)
+                result['status'] = status
+                result['latency_ms'] = int((time.time() - start) * 1000)
+                if status == 200 and data is not None:
+                    try:
+                        if ep['validate'](data):
+                            result['ok'] = True
+                        else:
+                            result['error'] = 'Validation failed (schema changed?)'
+                    except Exception:
+                        result['error'] = 'Validation error'
+                else:
+                    result['error'] = f'HTTP {status}'
+            elif ep['type'] == 'text':
+                r = requests.get(ep['url'], headers=AdaptiveFetcher.STEALTH_HEADERS,
+                                 timeout=12, allow_redirects=True)
+                result['status'] = r.status_code
+                result['latency_ms'] = int((time.time() - start) * 1000)
+                if r.status_code == 200:
+                    try:
+                        if ep['validate'](r.text):
+                            result['ok'] = True
+                        else:
+                            result['error'] = 'Response too short or empty'
+                    except Exception:
+                        result['error'] = 'Validation error'
+                else:
+                    result['error'] = f'HTTP {r.status_code}'
+            elif ep['type'] == 'binary':
+                r = requests.get(ep['url'], headers=AdaptiveFetcher.STEALTH_HEADERS,
+                                 timeout=12, allow_redirects=True)
+                result['status'] = r.status_code
+                result['latency_ms'] = int((time.time() - start) * 1000)
+                if r.status_code == 200:
+                    try:
+                        if ep['validate'](r.content):
+                            result['ok'] = True
+                        else:
+                            result['error'] = 'Empty response'
+                    except Exception:
+                        result['error'] = 'Validation error'
+                else:
+                    result['error'] = f'HTTP {r.status_code}'
+        except requests.Timeout:
+            result['latency_ms'] = int((time.time() - start) * 1000)
+            result['error'] = 'Timeout'
+        except Exception as e:
+            result['latency_ms'] = int((time.time() - start) * 1000)
+            result['error'] = str(e)
+
+        return result
+
+    def check_all(self):
+        """Check all endpoints. Returns list of result dicts."""
+        results = []
+        for name in self.ENDPOINTS:
+            log.info(f'  Checking {name}...')
+            r = self.check_endpoint(name)
+            status_icon = '\u2713' if r['ok'] else ('\u2717' if r['critical'] else '\u26a0')
+            latency = f"{r['latency_ms']}ms"
+            log.info(f'    {status_icon} {r["description"]} — {latency}'
+                     + (f' ({r["error"]})' if r['error'] else ''))
+            results.append(r)
+        return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FLIGHT MAP FEATURE VALIDATOR
+# ═══════════════════════════════════════════════════════════════════════════════
+class FlightMapFeatureValidator:
+    """
+    Validates that all expected features are present in the Flight Map HTML.
+    Detects multi-network support, layer toggles, resilient fetch engine, etc.
+    """
+
+    # Feature definitions: (feature_name, regex_pattern, description, critical)
+    FEATURES = [
+        # ── Multi-network data sources ──
+        ('vatsim_fetch',
+         r'pfetch\s*\(\s*[\'"]https://data\.vatsim\.net/v3/vatsim-data\.json',
+         'VATSIM data fetch', True),
+        ('ivao_fetch',
+         r'pfetch\s*\(\s*[\'"]https://api\.ivao\.aero/v2/tracker/whazzup',
+         'IVAO whazzup fetch', True),
+        ('poscon_fetch',
+         r'pfetch\s*\(\s*[\'"]https://hqapi\.poscon\.net/online\.json',
+         'POSCON online fetch', True),
+        ('normalizeIVAOPilot',
+         r'function\s+normalizeIVAOPilot',
+         'IVAO pilot normalizer', True),
+        ('normalizePOSCONPilot',
+         r'function\s+normalizePOSCONPilot',
+         'POSCON pilot normalizer', True),
+        ('normalizePOSCONAtc',
+         r'function\s+normalizePOSCONAtc',
+         'POSCON ATC normalizer', True),
+        ('getAllPilots',
+         r'function\s+getAllPilots',
+         'Multi-network pilot merger', True),
+
+        # ── Resilient fetch engine ──
+        ('pfetch_resilient',
+         r'const\s+_pf\s*=\s*\{',
+         'Resilient _pf fetch engine', True),
+        ('circuit_breaker',
+         r'cbThreshold|circuit.*breaker',
+         'Circuit breaker pattern', False),
+        ('request_dedup',
+         r'inflight.*Map|dedup',
+         'Request deduplication', False),
+        ('cors_proxy',
+         r'CORS_PROXY\s*=\s*[\'"]https://.*\.workers\.dev/',
+         'CORS proxy worker URL', True),
+
+        # ── Map layers ──
+        ('fir_boundaries',
+         r'vatspy.*Boundaries\.geojson|firData',
+         'FIR/UIR boundary layer', False),
+        ('sigmet_layer',
+         r'aviationweather\.gov/api/data/sigmet|sigmetLayer',
+         'SIGMET weather overlay', False),
+        ('weather_radar',
+         r'rainviewer\.com|wxRadarLayer',
+         'RainViewer weather radar', False),
+        ('metar_flight_cats',
+         r'fltcat|wxMetarData|metar.*json.*hours',
+         'METAR flight category colors', False),
+        ('speed_vectors',
+         r'vectorLayer|speed.*vector|VEC',
+         'Speed vector lines', False),
+        ('prefiles_layer',
+         r'prefileLayer|prefile|PRE',
+         'Prefile route display', False),
+
+        # ── UI components ──
+        ('search_overlay',
+         r'search-box|search-input|searchInput',
+         'Search overlay (callsign/airport)', False),
+        ('network_filter',
+         r'net-filter|network.*filter|filterNet',
+         'Network filter (VATSIM/IVAO/POSCON)', False),
+        ('legend_panel',
+         r'legend-panel|aircraft.*legend',
+         'Aircraft legend panel', False),
+        ('welcome_popup',
+         r'welcome-popup|welcomePopup|welcome.*modal',
+         'Welcome popup / onboarding', False),
+        ('atis_voice',
+         r'atis.*voice|playATIS|speechSynthesis',
+         'ATIS voice synthesis', False),
+
+        # ── Parallel data fetching ──
+        ('parallel_fetch',
+         r'Promise\.all\s*\(\s*\[[\s\S]*?pfetch.*pfetch',
+         'Parallel multi-network fetch', True),
+    ]
+
+    @classmethod
+    def validate(cls, html):
+        """
+        Validate all features are present in the HTML.
+        Returns list of (feature_name, found, description, critical).
+        """
+        results = []
+        for name, pattern, desc, critical in cls.FEATURES:
+            found = bool(re.search(pattern, html, re.IGNORECASE))
+            results.append((name, found, desc, critical))
+        return results
+
+    @classmethod
+    def report(cls, results):
+        """Print a formatted feature validation report."""
+        log.info('--- Flight Map Feature Validation ---')
+        found_count = sum(1 for _, f, _, _ in results if f)
+        total = len(results)
+        missing_critical = [(n, d) for n, f, d, c in results if not f and c]
+        missing_optional = [(n, d) for n, f, d, c in results if not f and not c]
+
+        for name, found, desc, critical in results:
+            icon = '\u2713' if found else ('\u2717' if critical else '\u26a0')
+            tag = ' [CRITICAL]' if critical and not found else ''
+            log.info(f'  {icon} {desc}{tag}')
+
+        log.info(f'\n  Features: {found_count}/{total} detected')
+        if missing_critical:
+            log.warning(f'  \u26a0 {len(missing_critical)} CRITICAL feature(s) missing:')
+            for n, d in missing_critical:
+                log.warning(f'    - {d} ({n})')
+        if missing_optional:
+            log.info(f'  {len(missing_optional)} optional feature(s) not detected (may be fine):')
+            for n, d in missing_optional:
+                log.info(f'    - {d}')
+        log.info('')
+        return missing_critical
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE PAGE PARSER — for scraping version/link data from any page
+# ═══════════════════════════════════════════════════════════════════════════════
+class AdaptiveParser:
+    """
+    Multi-strategy version extraction inspired by Scrapling.
+    Survives page redesigns by using 6 independent strategies.
+    """
+
+    VERSION_RE = re.compile(
+        r'(?:v|ver(?:sion)?\.?\s*)?(\d+\.\d+(?:\.\d+)?(?:[._-]?\w+)?)',
+        re.IGNORECASE
+    )
+    SEMVER_RE = re.compile(r'(\d+\.\d+\.\d+)')
+
+    def find_version(self, html, hints=None):
+        """
+        Extract version from HTML using multiple strategies.
+        Returns list of (version, confidence, strategy_name).
+        """
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, 'html.parser')
+        candidates = []
+        hints = [h.lower() for h in (hints or [])]
+
+        # Strategy 1: Headings / title text
+        for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'title']):
+            text = tag.get_text(strip=True)
+            for m in self.VERSION_RE.finditer(text):
+                candidates.append((m.group(1), 0.85, 'heading'))
+
+        # Strategy 2: Download links
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            text = a.get_text(strip=True)
+            combined = f'{text} {href}'
+            for m in self.VERSION_RE.finditer(combined):
+                ver = m.group(1)
+                conf = 0.80
+                if any(kw in combined.lower() for kw in ['download', 'release', 'latest']):
+                    conf = 0.90
+                if hints and any(h in combined.lower() for h in hints):
+                    conf = 0.92
+                candidates.append((ver, conf, 'download-link'))
+
+        # Strategy 3: Version-related attributes
+        version_selectors = [
+            '[class*="version"]', '[id*="version"]',
+            '[data-version]', '[class*="release"]', '[id*="release"]',
+        ]
+        for sel in version_selectors:
+            for el in soup.select(sel):
+                text = el.get_text(strip=True)
+                attr_ver = el.get('data-version', '')
+                for source in [text, attr_ver]:
+                    for m in self.VERSION_RE.finditer(source):
+                        candidates.append((m.group(1), 0.88, 'attribute'))
+
+        # Strategy 4: JSON-LD structured data
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                ld = json.loads(script.string or '')
+                if isinstance(ld, dict):
+                    ver = ld.get('version') or ld.get('softwareVersion', '')
+                    if ver:
+                        m = self.VERSION_RE.match(str(ver))
+                        if m:
+                            candidates.append((m.group(1), 0.95, 'json-ld'))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Strategy 5: Inline JS version strings
+        for script in soup.find_all('script'):
+            if script.string:
+                text = script.string[:5000]
+                for pat in [r'"version"\s*:\s*"([\d.]+)"',
+                            r"'version'\s*:\s*'([\d.]+)'",
+                            r'version\s*=\s*["\']?([\d.]+)']:
+                    for m in re.finditer(pat, text):
+                        candidates.append((m.group(1), 0.75, 'inline-js'))
+
+        # Strategy 6: Hint proximity — text near hint keywords
+        if hints:
+            full_text = soup.get_text()
+            for hint in hints:
+                idx = full_text.lower().find(hint)
+                if idx >= 0:
+                    window = full_text[max(0, idx - 100):idx + 200]
+                    for m in self.SEMVER_RE.finditer(window):
+                        candidates.append((m.group(1), 0.82, 'hint-proximity'))
+
+        # Strategy 7: Broad regex fallback
+        full_text = soup.get_text()
+        for m in self.SEMVER_RE.finditer(full_text):
+            candidates.append((m.group(1), 0.40, 'broad-regex'))
+
+        return candidates
+
+    @staticmethod
+    def best_version(candidates):
+        """Pick the best version from candidates list."""
+        if not candidates:
+            return None, 0, None
+        # Sort by confidence desc, then by version desc
+        def ver_key(v):
+            parts = re.split(r'[._-]', v)
+            nums = []
+            for p in parts:
+                try:
+                    nums.append(int(p))
+                except ValueError:
+                    break
+            return tuple(nums)
+
+        candidates.sort(key=lambda x: (-x[1], [-n for n in ver_key(x[0])]))
+        return candidates[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HTML PATCHER — updates CDN URLs in HTML files
+# ═══════════════════════════════════════════════════════════════════════════════
+class HTMLPatcher:
+    """Patches CDN URLs and adds content to HTML files."""
+
+    @staticmethod
+    def update_cdn_version(html, lib_name, old_version, new_version):
+        """Replace CDN version in all URLs for a given library."""
+        if old_version == new_version:
+            return html, 0
+        count = 0
+        # Replace version in CDN URLs
+        pattern = re.escape(old_version)
+        def replacer(m):
+            nonlocal count
+            count += 1
+            return m.group(0).replace(old_version, new_version)
+
+        # Only replace in CDN URLs (not in arbitrary text)
+        cdn_pattern = rf'(cdnjs\.cloudflare\.com/ajax/libs/[^"\']+?){re.escape(old_version)}'
+        html = re.sub(cdn_pattern, lambda m: m.group(0).replace(old_version, new_version), html)
+        return html, html.count(new_version)
+
+    @staticmethod
+    def add_footer(html, footer_html):
+        """Insert footer HTML before closing </body> tag."""
+        # Check if footer already exists
+        if 'pss-global-footer' in html:
+            # Replace existing footer
+            html = re.sub(
+                r'<div[^>]*id="pss-global-footer"[^>]*>.*?</div>\s*(?=</body>)',
+                footer_html + '\n',
+                html,
+                flags=re.DOTALL
+            )
+            return html
+
+        # Insert before </body>
+        html = html.replace('</body>', footer_html + '\n</body>')
+        return html
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RESILIENT PFETCH GENERATOR — enhanced client-side fetch with retry/fallback
+# ═══════════════════════════════════════════════════════════════════════════════
+def generate_resilient_pfetch():
+    """
+    Generate enhanced pfetch() JS code matching the deployed Flight Map's
+    resilient fetch engine with:
+    - Automatic retry with exponential backoff
+    - Request deduplication
+    - Circuit breaker pattern
+    - Timeout handling (15s AbortController)
+    """
+    return '''
+  // ═══ RESILIENT FETCH ENGINE ═══
+  // Enhanced pfetch() with automatic retry, circuit breaker, and request deduplication.
+  // Scrapling-inspired adaptive resilience for client-side fetching.
+  // Just call pfetch(url, opts) instead of fetch(url, opts).
+  const _pf = {
+    proxy: CORS_PROXY,
+    retries: 2,
+    baseDelay: 1000,
+    inflight: new Map(),   // dedup concurrent identical requests
+    circuits: new Map(),   // circuit breaker per domain
+    cbThreshold: 3,        // failures before circuit opens
+    cbResetMs: 60000,      // circuit breaker reset time (1 min)
+
+    // Circuit breaker: track failures per domain
+    _domain(url){ try{ return new URL(url).hostname; }catch(e){ return url; } },
+    _cbState(domain){
+      if(!this.circuits.has(domain)) this.circuits.set(domain, {fails:0, openUntil:0});
+      return this.circuits.get(domain);
+    },
+    _cbFail(domain){
+      const s = this._cbState(domain);
+      s.fails++;
+      if(s.fails >= this.cbThreshold) s.openUntil = Date.now() + this.cbResetMs;
+    },
+    _cbOk(domain){ const s = this._cbState(domain); s.fails = 0; s.openUntil = 0; },
+    _cbOpen(domain){ const s = this._cbState(domain); return s.openUntil > Date.now(); },
+
+    // Core fetch with retry + backoff
+    async fetch(url, opts = {}){
+      const domain = this._domain(url);
+      if(this._cbOpen(domain)){
+        console.warn(`[pfetch] Circuit open for ${domain}, skipping`);
+        throw new Error(`Circuit breaker open for ${domain}`);
+      }
+
+      // Dedup: if same URL is already inflight, piggyback on it
+      const key = url + JSON.stringify(opts);
+      if(this.inflight.has(key)) return this.inflight.get(key);
+
+      const attempt = async (retriesLeft) => {
+        try{
+          const controller = new AbortController();
+          const timeoutId = setTimeout(()=> controller.abort(), 15000);
+          const r = await fetch(this.proxy + encodeURIComponent(url), {
+            ...opts,
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          if(!r.ok && retriesLeft > 0 && r.status >= 500){
+            await new Promise(ok => setTimeout(ok, this.baseDelay * (this.retries - retriesLeft + 1)));
+            return attempt(retriesLeft - 1);
+          }
+          this._cbOk(domain);
+          return r;
+        }catch(e){
+          if(retriesLeft > 0 && e.name !== 'AbortError'){
+            await new Promise(ok => setTimeout(ok, this.baseDelay * (this.retries - retriesLeft + 1)));
+            return attempt(retriesLeft - 1);
+          }
+          this._cbFail(domain);
+          throw e;
+        }
+      };
+
+      const promise = attempt(this.retries).finally(()=> this.inflight.delete(key));
+      this.inflight.set(key, promise);
+      return promise;
+    }
+  };
+
+  function pfetch(url, opts){ return _pf.fetch(url, opts); }'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORS PROXY EXTRACTOR
+# ═══════════════════════════════════════════════════════════════════════════════
+def extract_cors_proxy(html):
+    """Extract the CORS proxy URL from the HTML file."""
+    m = re.search(r"CORS_PROXY\s*=\s*['\"]([^'\"]+)['\"]", html)
+    return m.group(1) if m else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOOTER HTML
+# ═══════════════════════════════════════════════════════════════════════════════
+FOOTER_HTML = '''<div id="pss-global-footer" style="
+  width:100%; padding:18px 24px; margin-top:0;
+  background:linear-gradient(180deg, rgba(15,23,42,0) 0%, rgba(15,23,42,0.95) 100%);
+  border-top:1px solid rgba(255,255,255,0.06);
+  text-align:center; font-family:'Outfit','DM Sans',system-ui,sans-serif;
+  font-size:11.5px; color:rgba(148,163,184,0.7); letter-spacing:0.2px;
+  line-height:1.7; box-sizing:border-box;
+">\u00a9 2026 Pushstart LLC &nbsp;|&nbsp; Trademarks belong to their respective owners. All rights reserved. Made by humans in Austin, TX &nbsp;|&nbsp; <a href="https://pushstartsims.com/privacy-policy" target="_blank" rel="noopener" style="color:rgba(96,165,250,0.8);text-decoration:underline;text-underline-offset:2px;">Privacy Policy</a> &nbsp;|&nbsp; <a href="https://pushstartsims.com/terms-of-use" target="_blank" rel="noopener" style="color:rgba(96,165,250,0.8);text-decoration:underline;text-underline-offset:2px;">Terms of Use</a></div>'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════════════════════
+def find_file(name_pattern, search_dir='.'):
+    """Find an HTML file matching a pattern."""
+    p = Path(search_dir)
+    for f in p.glob('*.html'):
+        if name_pattern.lower() in f.name.lower():
+            return f
+    return None
+
+
+def process_flight_map(filepath, fetcher, args):
+    """Process PSS Virtual Flight Map — check APIs, validate features, update CDNs, enhance pfetch."""
+    log.info(f'\n{"="*60}')
+    log.info(f'  PSS Virtual Flight Map')
+    log.info(f'  {filepath}')
+    log.info(f'{"="*60}\n')
+
+    html = Path(filepath).read_text(encoding='utf-8')
+    modified = False
+
+    # 1. Validate all expected features are present
+    log.info('--- Feature Validation ---')
+    feature_results = FlightMapFeatureValidator.validate(html)
+    missing_critical = FlightMapFeatureValidator.report(feature_results)
+    if missing_critical:
+        log.warning('  \u26a0 Some critical features are missing — the HTML may be outdated or corrupted.')
+        log.warning('  Consider re-deploying the latest version.\n')
+
+    # 2. Extract and validate CORS proxy URL
+    cors_proxy = extract_cors_proxy(html)
+    if cors_proxy:
+        log.info(f'  CORS Proxy: {cors_proxy}')
+        # Dynamically update the cors_proxy endpoint URL for health checking
+        APIHealthChecker.ENDPOINTS['cors_proxy']['url'] = (
+            cors_proxy + 'https%3A%2F%2Fdata.vatsim.net%2Fv3%2Fvatsim-data.json'
+        )
+    else:
+        log.warning('  \u26a0 CORS_PROXY not found in HTML — proxy health check will use default URL')
+    log.info('')
+
+    # 3. Check API endpoint health
+    if args.check_apis or not args.update_cdns:
+        log.info('--- API Endpoint Health Check ---')
+        api_checker = APIHealthChecker(fetcher)
+        results = api_checker.check_all()
+        ok_count = sum(1 for r in results if r['ok'])
+        total = len(results)
+        critical_fail = [r for r in results if not r['ok'] and r['critical']]
+        log.info(f'\n  API Health: {ok_count}/{total} endpoints responding')
+        if critical_fail:
+            log.warning(f'  \u26a0 {len(critical_fail)} CRITICAL endpoint(s) DOWN:')
+            for r in critical_fail:
+                log.warning(f'    - {r["description"]}: {r["error"]}')
+        log.info('')
+
+    # 4. Check CDN versions
+    log.info('--- CDN Version Check ---')
+    cdn_checker = CDNVersionChecker(fetcher)
+    cdn_updates = {}
+    for lib_name in ['leaflet']:  # Only leaflet is used in the Flight Map
+        current = cdn_checker.get_current_version(html, lib_name)
+        if current:
+            latest, conf, source = cdn_checker.check_latest(lib_name)
+            if latest:
+                if current != latest:
+                    log.info(f'  {lib_name}: {current} \u2192 {latest} (from {source}, conf={conf:.0%})')
+                    cdn_updates[lib_name] = (current, latest)
+                else:
+                    log.info(f'  {lib_name}: {current} \u2713 (up to date)')
+            else:
+                log.info(f'  {lib_name}: {current} (could not check latest)')
+    log.info('')
+
+    # 5. Update CDN URLs if requested
+    if args.update_cdns and cdn_updates and not args.dry_run:
+        log.info('--- Updating CDN URLs ---')
+        for lib_name, (old_v, new_v) in cdn_updates.items():
+            html, count = HTMLPatcher.update_cdn_version(html, lib_name, old_v, new_v)
+            log.info(f'  {lib_name}: updated {old_v} \u2192 {new_v}')
+            modified = True
+
+    # 6. Enhance pfetch with resilient fetch engine (skip if already present)
+    old_pfetch = "function pfetch(url, opts){\n    return fetch(CORS_PROXY + encodeURIComponent(url), opts);\n  }"
+    if old_pfetch in html and '_pf' not in html:
+        log.info('--- Upgrading pfetch to Resilient Fetch Engine ---')
+        resilient = generate_resilient_pfetch()
+        html = html.replace(old_pfetch, resilient)
+        modified = True
+        log.info('  \u2713 pfetch upgraded with retry, circuit breaker, dedup')
+    elif '_pf' in html:
+        log.info('  pfetch already has resilient engine \u2713')
+    log.info('')
+
+    # 7. Add footer
+    if 'pss-global-footer' not in html or 'pss-global-footer' in html:
+        log.info('--- Adding/Updating Footer ---')
+        html = HTMLPatcher.add_footer(html, FOOTER_HTML)
+        modified = True
+        log.info('  \u2713 Footer added/updated')
+    log.info('')
+
+    # Write
+    if modified and not args.dry_run:
+        Path(filepath).write_text(html, encoding='utf-8')
+        log.info(f'  \u2713 Saved: {filepath}')
+    elif args.dry_run:
+        log.info('  (dry run \u2014 no files modified)')
+
+    return html
+
+
+def process_roi_tool(filepath, fetcher, args):
+    """Process Pushstart Simulators ROI Tool — check CDNs, add footer."""
+    log.info(f'\n{"="*60}')
+    log.info(f'  Pushstart Simulators ROI Tool')
+    log.info(f'  {filepath}')
+    log.info(f'{"="*60}\n')
+
+    html = Path(filepath).read_text(encoding='utf-8')
+    modified = False
+
+    # 1. Check CDN versions
+    log.info('--- CDN Version Check ---')
+    cdn_checker = CDNVersionChecker(fetcher)
+    cdn_updates = {}
+    for lib_name in ['chart.js', 'html2canvas', 'jspdf']:
+        current = cdn_checker.get_current_version(html, lib_name)
+        if current:
+            latest, conf, source = cdn_checker.check_latest(lib_name)
+            if latest:
+                if current != latest:
+                    log.info(f'  {lib_name}: {current} \u2192 {latest} (from {source}, conf={conf:.0%})')
+                    cdn_updates[lib_name] = (current, latest)
+                else:
+                    log.info(f'  {lib_name}: {current} \u2713 (up to date)')
+            else:
+                log.info(f'  {lib_name}: {current} (could not check latest)')
+    log.info('')
+
+    # 2. Update CDN URLs if requested
+    if args.update_cdns and cdn_updates and not args.dry_run:
+        log.info('--- Updating CDN URLs ---')
+        for lib_name, (old_v, new_v) in cdn_updates.items():
+            html, count = HTMLPatcher.update_cdn_version(html, lib_name, old_v, new_v)
+            log.info(f'  {lib_name}: updated {old_v} \u2192 {new_v}')
+            modified = True
+
+    # 3. Add footer
+    log.info('--- Adding/Updating Footer ---')
+    html = HTMLPatcher.add_footer(html, FOOTER_HTML)
+    modified = True
+    log.info('  \u2713 Footer added/updated')
+    log.info('')
+
+    # Write
+    if modified and not args.dry_run:
+        Path(filepath).write_text(html, encoding='utf-8')
+        log.info(f'  \u2713 Saved: {filepath}')
+    elif args.dry_run:
+        log.info('  (dry run \u2014 no files modified)')
+
+    return html
+
+
+def main():
+    parser = argparse.ArgumentParser(description='PSS Tools Updater — Adaptive CDN & API Checker')
+    parser.add_argument('--dir', default='.', help='Directory containing HTML files')
+    parser.add_argument('--only', help='Only process: map, roi (comma-separated)')
+    parser.add_argument('--dry-run', action='store_true', help='Report only, no file writes')
+    parser.add_argument('--headless', action='store_true', help='Force Playwright for all fetches')
+    parser.add_argument('--no-headless', action='store_true', help='Skip Playwright entirely')
+    parser.add_argument('--update-cdns', action='store_true', help='Update CDN URLs to latest versions')
+    parser.add_argument('--check-apis', action='store_true', help='Run API endpoint health checks')
+    args = parser.parse_args()
+
+    pw_mode = 'auto'
+    if args.headless:
+        pw_mode = 'always'
+    elif args.no_headless:
+        pw_mode = 'never'
+
+    fetcher = AdaptiveFetcher(use_playwright=pw_mode)
+
+    targets = (args.only or 'map,roi').lower().split(',')
+
+    log.info(f'\n{"="*60}')
+    log.info(f'  PSS Tools Updater \u2014 Adaptive CDN & API Checker')
+    log.info(f'  {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    log.info(f'  Playwright mode: {pw_mode}')
+    log.info(f'{"="*60}')
+
+    # Find files
+    search_dir = args.dir
+
+    if 'map' in targets:
+        map_file = find_file('flight map', search_dir) or find_file('virtual flight', search_dir)
+        if map_file:
+            process_flight_map(str(map_file), fetcher, args)
+        else:
+            log.warning('  Flight Map HTML not found in search directory')
+
+    if 'roi' in targets:
+        roi_file = find_file('roi tool', search_dir) or find_file('profitability', search_dir)
+        if roi_file:
+            process_roi_tool(str(roi_file), fetcher, args)
+        else:
+            log.warning('  ROI Tool HTML not found in search directory')
+
+    fetcher.close()
+    log.info(f'\n  Done.\n')
