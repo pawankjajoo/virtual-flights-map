@@ -1310,8 +1310,10 @@
   'use strict';
 
   // ═══ CORS PROXY ═══
-  // All cross-origin API calls are routed through this Cloudflare Worker
-  // so the map works inside a Wix iframe without CORS failures.
+  // Only used for APIs that lack browser CORS headers (opennav.com, aviationweather.gov).
+  // APIs with proper CORS (vatsim.net, github raw, rainviewer) are called DIRECTLY
+  // to reduce worker quota usage, latency, and improve load times.
+  // The batch endpoint aggregates VATSIM+IVAO+POSCON into one cached call (12s TTL).
   const CORS_PROXY = 'https://pss-cors-proxy.pushstartsims-com.workers.dev/?url=';
   const BATCH_URL  = 'https://pss-cors-proxy.pushstartsims-com.workers.dev/batch';
 
@@ -1383,7 +1385,6 @@
   // Built on Scrapling-inspired adaptive resilience principles.
   // Just call pfetch(url, opts) instead of fetch(url, opts).
   const _pf = {
-    proxy: CORS_PROXY,
     retries: 2,
     baseDelay: 1000,
     inflight: new Map(),   // dedup concurrent identical requests
@@ -1406,6 +1407,7 @@
     _cbOpen(domain){ const s = this._cbState(domain); return s.openUntil > Date.now(); },
 
     // Core fetch with retry + exponential backoff
+    // URL is fetched AS-IS — callers prepend CORS_PROXY only when needed
     async fetch(url, opts = {}){
       const domain = this._domain(url);
       if(this._cbOpen(domain)){
@@ -1421,7 +1423,7 @@
         try{
           const controller = new AbortController();
           const timeoutId = setTimeout(()=> controller.abort(), 15000);
-          const r = await fetch(this.proxy + encodeURIComponent(url), {
+          const r = await fetch(url, {
             ...opts,
             signal: controller.signal
           });
@@ -1448,12 +1450,14 @@
     }
   };
 
+  // Resilient fetch — pass URL directly (no auto-proxy).
+  // For APIs that need CORS proxy, callers prepend CORS_PROXY themselves.
   function pfetch(url, opts){ return _pf.fetch(url, opts); }
 
   // ── STATE ──
   // Main data object from VATSIM API, map instance, & leaflet layer refs
   let data=null, txMap={}, map=null, pilotsLyr=null, atcLyr=null, routeLyr=null, prefLyr=null,
-      lastUpd=null, selPilot=null, curTab='pilots', mode='live';
+      lastUpd=null, selPilot=null, _selRouteStr=null, curTab='pilots', mode='live';
   // Gate for loader to stay visible until first API fetch suceeeds
   let firstDataLoaded=false; // gate: loader stays until first data fetch succeeds
   // Layer visibility toggles — synced with UI buttons
@@ -1945,6 +1949,20 @@
     UWKD:[55.6063,49.2787],UNKL:[56.1730,92.4933],UNNT:[55.0122,82.6503],UNEE:[53.3531,87.5930],
     UIAA:[52.0267,113.3053],UNTT:[57.3797,74.5763],UEEE:[62.0933,129.7725],UHMD:[50.8853,134.6903],
     UHPP:[53.1679,158.4540],UHSS:[46.8886,142.7178],
+    // ── Additional IVAO/POSCON popular airports ──
+    DAAD:[36.712,3.25],EBCI:[50.4592,4.4538],EBOS:[51.1989,2.8622],EHEH:[51.4501,5.3745],
+    FSIA:[-4.6714,55.5218],GMMX:[31.6069,-8.0363],GOOY:[14.7394,-17.4902],HTDA:[-6.8781,39.2026],
+    KCVG:[39.0488,-84.6678],KDCA:[38.8521,-77.0377],KELP:[31.8072,-106.3776],KIND:[39.7173,-86.2942],
+    KSAN:[32.7336,-117.1897],LEST:[42.8963,-8.4151],LEXJ:[43.4271,-3.82],LFBO:[43.6292,1.3638],
+    LFLX:[46.8622,1.7217],LFML:[43.4367,5.215],LFST:[48.5383,7.6283],LGIR:[35.3397,25.1803],
+    LHDC:[47.4893,19.0422],LICZ:[37.4667,15.0664],LIMF:[45.2006,7.6497],LKMT:[49.6963,18.1111],
+    LLBG:[32.0094,34.8822],LRCL:[46.7852,23.6862],LROP:[44.5711,26.085],LTCG:[40.9951,39.7817],
+    LTFM:[41.2609,28.7419],MMTJ:[32.5411,-116.9703],MUHA:[22.9892,-82.4091],OBBI:[26.2708,50.6336],
+    OIBB:[27.2183,56.3778],OIIE:[35.4161,51.1522],OISS:[29.5392,52.5898],OLBA:[33.8206,35.4886],
+    OMDW:[24.8967,55.1614],OTHH:[25.2731,51.6081],SABE:[-34.5592,-58.4156],SEQM:[-0.1292,-78.3575],
+    SLLP:[-16.5133,-68.1922],SVMI:[10.6012,-66.9912],TBPB:[13.0746,-59.4925],TIST:[18.3373,-64.9734],
+    TJSJ:[18.4394,-66.0018],TNCM:[18.041,-63.1089],TTPP:[10.5953,-61.3372],UWWW:[53.5041,50.1643],
+    VOHS:[17.2403,78.4294],VOMM:[12.9941,80.1707],YPPH:[-31.9403,115.9669],YSCB:[-35.3069,149.1951],
   };
 
 
@@ -1960,10 +1978,83 @@
   }
 
 
+  // ═══ AIRAC CYCLE AUTO-CALCULATOR ═════════════════════════════════════════════
+  // Computes the current AIRAC cycle identifier (YYNN) and effective/expiry dates.
+  // AIRAC cycles are exactly 28 days long worldwide (ICAO Doc 8126).
+  // Epoch: 1901-01-10 (ICAO Doc 8126 reference). Cycle 2601 = 2026-01-22.
+  // Full schedule verified against FAA 28/56-day Product Schedule & Eurocontrol.
+  //
+  // ── Official AIRAC Effective Dates Reference (2026-2028) ──────────────────────
+  // 2026: 2601=Jan22  2602=Feb19  2603=Mar19  2604=Apr16  2605=May14  2606=Jun11
+  //       2607=Jul09  2608=Aug06  2609=Sep03  2610=Oct01  2611=Oct29  2612=Nov26
+  //       2613=Dec24
+  // 2027: 2701=Jan21  2702=Feb18  2703=Mar18  2704=Apr15  2705=May13  2706=Jun10
+  //       2707=Jul08  2708=Aug05  2709=Sep02  2710=Sep30  2711=Oct28  2712=Nov25
+  //       2713=Dec23
+  // 2028: 2801=Jan20  2802=Feb17  2803=Mar16  2804=Apr13  2805=May11  2806=Jun08
+  //       2807=Jul06  2808=Aug03  2809=Aug31  2810=Sep28  2811=Oct26  2812=Nov23
+  //       2813=Dec21
+  // ──────────────────────────────────────────────────────────────────────────────
+
+  // Lookup table for validation (cycle → effective date YYYY-MM-DD)
+  const AIRAC_SCHEDULE = {
+    '2601':'2026-01-22','2602':'2026-02-19','2603':'2026-03-19','2604':'2026-04-16',
+    '2605':'2026-05-14','2606':'2026-06-11','2607':'2026-07-09','2608':'2026-08-06',
+    '2609':'2026-09-03','2610':'2026-10-01','2611':'2026-10-29','2612':'2026-11-26',
+    '2613':'2026-12-24',
+    '2701':'2027-01-21','2702':'2027-02-18','2703':'2027-03-18','2704':'2027-04-15',
+    '2705':'2027-05-13','2706':'2027-06-10','2707':'2027-07-08','2708':'2027-08-05',
+    '2709':'2027-09-02','2710':'2027-09-30','2711':'2027-10-28','2712':'2027-11-25',
+    '2713':'2027-12-23',
+    '2801':'2028-01-20','2802':'2028-02-17','2803':'2028-03-16','2804':'2028-04-13',
+    '2805':'2028-05-11','2806':'2028-06-08','2807':'2028-07-06','2808':'2028-08-03',
+    '2809':'2028-08-31','2810':'2028-09-28','2811':'2028-10-26','2812':'2028-11-23',
+    '2813':'2028-12-21'
+  };
+
+  function computeCurrentAirac() {
+    const EPOCH = Date.UTC(2026, 0, 22); // 2026-01-22 = cycle 2601 (ICAO Doc 8126)
+    const CYCLE_MS = 28 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const cyclesFromEpoch = Math.floor((now - EPOCH) / CYCLE_MS);
+    const effectiveMs = EPOCH + cyclesFromEpoch * CYCLE_MS;
+    const expiresMs   = effectiveMs + 27 * 24 * 60 * 60 * 1000; // last valid day
+    const eff = new Date(effectiveMs);
+    const exp = new Date(expiresMs);
+
+    // Determine year and cycle-number-within-year
+    const year = eff.getUTCFullYear();
+    const jan1 = Date.UTC(year, 0, 1);
+    // First cycle of this year = first effective date on or after Jan 1
+    const dFromEpochToJan1 = jan1 - EPOCH;
+    const firstCycleOffset = (dFromEpochToJan1 >= 0)
+      ? Math.ceil(dFromEpochToJan1 / CYCLE_MS)
+      : Math.floor(dFromEpochToJan1 / CYCLE_MS);
+    const firstCycleMs = EPOCH + firstCycleOffset * CYCLE_MS;
+    const firstEff = (firstCycleMs < jan1) ? firstCycleMs + CYCLE_MS : firstCycleMs;
+    const nn = Math.floor((effectiveMs - firstEff) / CYCLE_MS) + 1;
+
+    const yy = String(year).slice(-2);
+    const pad = String(nn).padStart(2, '0');
+    const iso = d => d.toISOString().slice(0, 10);
+    const result = { cycle: yy + pad, effective: iso(eff), expires: iso(exp) };
+
+    // Cross-check against stored schedule if available
+    if (AIRAC_SCHEDULE[result.cycle] && AIRAC_SCHEDULE[result.cycle] !== result.effective) {
+      console.warn('[AIRAC] Schedule mismatch! Computed', result.cycle, '=', result.effective,
+        'but reference says', AIRAC_SCHEDULE[result.cycle], '— using reference date.');
+      result.effective = AIRAC_SCHEDULE[result.cycle];
+      const refMs = new Date(result.effective + 'T00:00:00Z').getTime();
+      result.expires = new Date(refMs + 27 * 86400000).toISOString().slice(0, 10);
+    }
+    return result;
+  }
+
   // ═══ AIRAC NAVAID DATABASE & ROUTE PARSER ═══════════════════════════════════
   // Bundled navigation database — VORs, NDBs, waypoints/fixes, and airways.
-  // Source: Static AIRAC data with auto-update framework. Cycle refreshes every 28 days.
-  const NAVDATA = {"cycle":"2601","effective":"2026-01-23","expires":"2026-02-19","source":"bundled-static-v1","navaids":{"JFK":{"type":"VOR","name":"New York Kennedy","lat":40.6413,"lon":-73.7781,"freq":"115.9","region":"K"},"LAX":{"type":"VOR","name":"Los Angeles International","lat":33.9425,"lon":-118.4081,"freq":"113.6","region":"K"},"ORD":{"type":"VOR","name":"Chicago O'Hare","lat":41.9742,"lon":-87.9073,"freq":"113.9","region":"K"},"ATL":{"type":"VOR","name":"Atlanta Hartsfield","lat":33.6407,"lon":-84.4277,"freq":"116.9","region":"K"},"DFW":{"type":"VOR","name":"Dallas Fort Worth","lat":32.8975,"lon":-97.038,"freq":"117.0","region":"K"},"BOS":{"type":"VOR","name":"Boston Logan","lat":42.3656,"lon":-71.0096,"freq":"112.7","region":"K"},"SFO":{"type":"VOR","name":"San Francisco International","lat":37.6213,"lon":-122.379,"freq":"115.8","region":"K"},"MIA":{"type":"VOR","name":"Miami International","lat":25.7959,"lon":-80.287,"freq":"115.9","region":"K"},"SEA":{"type":"VOR","name":"Seattle Tacoma","lat":47.4502,"lon":-122.3088,"freq":"116.8","region":"K"},"DEN":{"type":"NDB","name":"Delhi NDB","lat":28.5673,"lon":77.1025,"freq":"381","region":"VI"},"IAD":{"type":"VOR","name":"Washington Dulles","lat":38.8951,"lon":-77.4373,"freq":"113.3","region":"K"},"CLT":{"type":"VOR","name":"Charlotte Douglas","lat":35.214,"lon":-80.9431,"freq":"114.5","region":"K"},"PHL":{"type":"VOR","name":"Philadelphia International","lat":39.8744,"lon":-75.2424,"freq":"108.2","region":"K"},"DTW":{"type":"VOR","name":"Detroit Metropolitan","lat":42.2124,"lon":-83.3534,"freq":"113.6","region":"K"},"MSP":{"type":"VOR","name":"Minneapolis Saint Paul","lat":44.8844,"lon":-93.2218,"freq":"115.3","region":"K"},"BWI":{"type":"VOR","name":"Baltimore Washington","lat":39.1754,"lon":-76.6685,"freq":"115.5","region":"K"},"MCO":{"type":"VOR","name":"Orlando International","lat":28.4312,"lon":-81.3089,"freq":"112.2","region":"K"},"EWR":{"type":"VOR","name":"Newark","lat":40.6895,"lon":-74.1745,"freq":"115.3","region":"K"},"HPN":{"type":"VOR","name":"Westchester County","lat":41.0534,"lon":-73.8678,"freq":"110.4","region":"K"},"AGC":{"type":"VOR","name":"Pittsburgh Allegheny County","lat":40.3545,"lon":-79.9303,"freq":"110.0","region":"K"},"LAS":{"type":"VOR","name":"Las Vegas","lat":36.08,"lon":-115.1617,"freq":"113.1","region":"K"},"PHX":{"type":"VOR","name":"Phoenix Sky Harbor","lat":33.4484,"lon":-112.0742,"freq":"115.1","region":"K"},"DAL":{"type":"VOR","name":"Dallas Love Field","lat":32.8472,"lon":-96.8374,"freq":"114.4","region":"K"},"HOU":{"type":"VOR","name":"Houston","lat":29.6435,"lon":-95.2794,"freq":"114.9","region":"K"},"DCA":{"type":"VOR","name":"Washington Reagan","lat":38.8516,"lon":-77.0375,"freq":"117.2","region":"K"},"LON":{"type":"VOR","name":"London","lat":51.4785,"lon":-0.4569,"freq":"113.6","region":"EG"},"SAM":{"type":"VOR","name":"Sammy","lat":51.6166,"lon":-0.25,"freq":"113.35","region":"EG"},"BPK":{"type":"VOR","name":"Brookman's Park","lat":51.7797,"lon":-0.2086,"freq":"117.5","region":"EG"},"LAM":{"type":"VOR","name":"Lambourne","lat":51.5547,"lon":0.4072,"freq":"110.85","region":"EG"},"OCK":{"type":"VOR","name":"Ockham","lat":51.35,"lon":-0.5086,"freq":"115.3","region":"EG"},"DET":{"type":"VOR","name":"Detling","lat":51.3097,"lon":0.6239,"freq":"115.15","region":"EG"},"HON":{"type":"VOR","name":"Honiley","lat":52.1814,"lon":-1.6869,"freq":"113.65","region":"EG"},"BHD":{"type":"VOR","name":"Bovingdon","lat":51.7436,"lon":-0.5361,"freq":"112.05","region":"EG"},"STN":{"type":"VOR","name":"Stansted","lat":51.8847,"lon":0.2381,"freq":"117.1","region":"EG"},"DVR":{"type":"VOR","name":"Daventry","lat":52.3,"lon":-1.3894,"freq":"114.95","region":"EG"},"GOW":{"type":"VOR","name":"Goodwood","lat":50.8614,"lon":-0.6325,"freq":"114.3","region":"EG"},"TLA":{"type":"VOR","name":"Tulla","lat":52.7636,"lon":-8.6425,"freq":"114.9","region":"EI"},"POL":{"type":"VOR","name":"Pole Hill","lat":54.9169,"lon":-2.1814,"freq":"112.1","region":"EG"},"KOK":{"type":"VOR","name":"Koksy","lat":55.0,"lon":-3.5,"freq":"114.5","region":"EG"},"SPI":{"type":"VOR","name":"Spitfire","lat":50.83,"lon":1.05,"freq":"113.0","region":"EG"},"BUB":{"type":"VOR","name":"Bubbenhall","lat":52.15,"lon":-1.55,"freq":"114.85","region":"EG"},"NIK":{"type":"VOR","name":"Nikki","lat":53.8,"lon":-2.25,"freq":"115.35","region":"EG"},"NTM":{"type":"VOR","name":"Nottingham","lat":52.9047,"lon":-1.25,"freq":"116.05","region":"EG"},"CDG":{"type":"VOR","name":"Paris Charles de Gaulle","lat":49.0097,"lon":2.5497,"freq":"115.35","region":"LF"},"FRA":{"type":"VOR","name":"Frankfurt","lat":50.0264,"lon":8.5636,"freq":"114.2","region":"ED"},"AMS":{"type":"VOR","name":"Amsterdam","lat":52.3086,"lon":4.7639,"freq":"108.4","region":"EH"},"MAD":{"type":"VOR","name":"Madrid","lat":40.4165,"lon":-3.6891,"freq":"112.5","region":"LE"},"FCO":{"type":"VOR","name":"Rome Fiumicino","lat":41.8002,"lon":12.2388,"freq":"113.6","region":"LI"},"MUN":{"type":"VOR","name":"Munich","lat":48.3538,"lon":11.7861,"freq":"112.3","region":"ED"},"ZUR":{"type":"VOR","name":"Zurich","lat":47.4647,"lon":8.5492,"freq":"116.05","region":"LS"},"BRU":{"type":"VOR","name":"Brussels","lat":50.901,"lon":4.4856,"freq":"114.6","region":"EB"},"LIS":{"type":"NDB","name":"Lisbon NDB","lat":38.6813,"lon":-9.1366,"freq":"342","region":"LP"},"ATH":{"type":"VOR","name":"Athens","lat":37.9364,"lon":23.9445,"freq":"112.4","region":"LG"},"IST":{"type":"VOR","name":"Istanbul","lat":41.2619,"lon":28.748,"freq":"116.2","region":"LT"},"DXB":{"type":"VOR","name":"Dubai","lat":25.2528,"lon":55.3643,"freq":"114.4","region":"OM"},"DOH":{"type":"VOR","name":"Doha","lat":25.2711,"lon":51.5536,"freq":"116.1","region":"OO"},"JED":{"type":"VOR","name":"Jeddah","lat":21.5169,"lon":39.1686,"freq":"110.5","region":"OE"},"BAH":{"type":"NDB","name":"Bahamas NDB","lat":26.2,"lon":-76.6,"freq":"394","region":"MB"},"AUH":{"type":"VOR","name":"Abu Dhabi","lat":24.433,"lon":54.6511,"freq":"113.3","region":"OM"},"KWI":{"type":"VOR","name":"Kuwait","lat":29.3759,"lon":47.9774,"freq":"114.2","region":"OK"},"RUH":{"type":"VOR","name":"Riyadh","lat":24.7258,"lon":46.6988,"freq":"113.2","region":"OE"},"MCT":{"type":"VOR","name":"Muscat","lat":23.5933,"lon":58.2842,"freq":"116.0","region":"OM"},"NRT":{"type":"VOR","name":"Narita Tokyo","lat":35.7653,"lon":140.3931,"freq":"112.4","region":"RJ"},"HND":{"type":"VOR","name":"Haneda Tokyo","lat":35.5494,"lon":139.7798,"freq":"112.2","region":"RJ"},"PEK":{"type":"VOR","name":"Beijing Capital","lat":40.0801,"lon":116.5847,"freq":"113.0","region":"ZB"},"PVG":{"type":"VOR","name":"Shanghai Pudong","lat":31.1437,"lon":121.805,"freq":"113.6","region":"ZS"},"HKG":{"type":"VOR","name":"Hong Kong","lat":22.3193,"lon":113.915,"freq":"113.35","region":"ZH"},"SIN":{"type":"VOR","name":"Singapore","lat":1.3521,"lon":103.8198,"freq":"112.5","region":"WS"},"BKK":{"type":"VOR","name":"Bangkok Suvarnabhumi","lat":13.69,"lon":100.7501,"freq":"116.0","region":"VT"},"ICN":{"type":"VOR","name":"Incheon Seoul","lat":37.4602,"lon":126.4407,"freq":"113.9","region":"RK"},"KUL":{"type":"VOR","name":"Kuala Lumpur","lat":2.7258,"lon":101.7103,"freq":"114.3","region":"WM"},"MNL":{"type":"VOR","name":"Manila Ninoy Aquino","lat":14.1895,"lon":121.0187,"freq":"114.2","region":"RP"},"DEL":{"type":"VOR","name":"Delhi Indira Gandhi","lat":28.5673,"lon":77.1025,"freq":"115.0","region":"VI"},"BOM":{"type":"NDB","name":"Bombay NDB","lat":19.0896,"lon":72.8656,"freq":"380","region":"VI"},"SYD":{"type":"VOR","name":"Sydney","lat":-33.9461,"lon":151.1772,"freq":"115.3","region":"Y"},"MEL":{"type":"VOR","name":"Melbourne","lat":-37.669,"lon":144.841,"freq":"114.1","region":"Y"},"AKL":{"type":"VOR","name":"Auckland","lat":-37.0082,"lon":174.7917,"freq":"113.7","region":"NZ"},"BNE":{"type":"VOR","name":"Brisbane","lat":-27.3842,"lon":153.1175,"freq":"112.1","region":"Y"},"PER":{"type":"VOR","name":"Perth","lat":-31.9403,"lon":115.9674,"freq":"113.7","region":"Y"},"GRU":{"type":"VOR","name":"Sao Paulo Guarulhos","lat":-23.4356,"lon":-46.4731,"freq":"114.3","region":"SB"},"EZE":{"type":"VOR","name":"Buenos Aires Ezeiza","lat":-34.8222,"lon":-58.5358,"freq":"115.5","region":"SA"},"BOG":{"type":"VOR","name":"Bogota El Dorado","lat":4.7016,"lon":-74.1479,"freq":"113.5","region":"SK"},"SCL":{"type":"VOR","name":"Santiago","lat":-33.3869,"lon":-70.3852,"freq":"113.9","region":"SC"},"LIM":{"type":"VOR","name":"Lima Jorge Chavez","lat":-12.0219,"lon":-77.109,"freq":"113.5","region":"SP"},"JNB":{"type":"VOR","name":"Johannesburg","lat":-26.1367,"lon":28.2411,"freq":"114.3","region":"FA"},"CPT":{"type":"VOR","name":"Cape Town","lat":-33.9249,"lon":18.6024,"freq":"112.3","region":"FA"},"NBO":{"type":"VOR","name":"Nairobi","lat":-1.3192,"lon":36.7478,"freq":"114.3","region":"HK"},"CAI":{"type":"VOR","name":"Cairo","lat":30.1219,"lon":31.4056,"freq":"112.3","region":"HE"},"CMN":{"type":"VOR","name":"Casablanca","lat":33.3675,"lon":-7.5898,"freq":"114.5","region":"GMMC"},"ADD":{"type":"VOR","name":"Addis Ababa","lat":9.0265,"lon":38.7469,"freq":"113.3","region":"HA"},"LOS":{"type":"VOR","name":"Lagos","lat":6.5769,"lon":3.3212,"freq":"112.3","region":"DN"},"YYJ":{"type":"VOR","name":"Victoria","lat":48.6432,"lon":-123.4251,"freq":"115.6","region":"CY"},"YVR":{"type":"VOR","name":"Vancouver","lat":49.1951,"lon":-123.1829,"freq":"111.0","region":"CY"},"YYC":{"type":"VOR","name":"Calgary","lat":51.1215,"lon":-114.0147,"freq":"115.0","region":"CY"},"YEG":{"type":"VOR","name":"Edmonton","lat":53.3097,"lon":-113.5794,"freq":"113.5","region":"CY"},"YWG":{"type":"VOR","name":"Winnipeg","lat":49.92,"lon":-97.2383,"freq":"116.3","region":"CY"},"YYZ":{"type":"VOR","name":"Toronto","lat":43.6773,"lon":-79.6301,"freq":"114.9","region":"CY"},"YUL":{"type":"VOR","name":"Montreal","lat":45.4655,"lon":-73.7485,"freq":"113.3","region":"CY"},"YHZ":{"type":"VOR","name":"Halifax","lat":44.8844,"lon":-63.5094,"freq":"115.2","region":"CY"},"MEX":{"type":"VOR","name":"Mexico City","lat":19.4363,"lon":-99.0722,"freq":"115.5","region":"MM"},"CUN":{"type":"VOR","name":"Cancun","lat":21.0065,"lon":-86.8769,"freq":"116.9","region":"MM"},"LAP":{"type":"VOR","name":"La Paz","lat":24.0656,"lon":-110.2584,"freq":"112.8","region":"MM"},"MOA":{"type":"NDB","name":"Montego Bay","lat":18.5039,"lon":-77.9163,"freq":"387","region":"MJ"},"NAS":{"type":"NDB","name":"Nassau","lat":25.0517,"lon":-77.4705,"freq":"356","region":"MB"},"CTS":{"type":"NDB","name":"Chitose Sapporo","lat":42.7936,"lon":141.6525,"freq":"385","region":"RJ"},"KUX":{"type":"NDB","name":"Kansai Osaka","lat":34.4277,"lon":135.2342,"freq":"362","region":"RJ"},"IGO":{"type":"NDB","name":"Incheon Ground","lat":37.4502,"lon":126.4407,"freq":"368","region":"RK"},"HGH":{"type":"NDB","name":"Hangzhou","lat":30.2741,"lon":120.4343,"freq":"375","region":"ZS"},"PVD":{"type":"NDB","name":"Pudong Shanghai","lat":31.1437,"lon":121.805,"freq":"376","region":"ZS"},"CTU":{"type":"NDB","name":"Chengdu","lat":30.5728,"lon":104.0668,"freq":"374","region":"ZU"},"PEE":{"type":"NDB","name":"Peking","lat":40.0801,"lon":116.5847,"freq":"377","region":"ZB"},"SGN":{"type":"NDB","name":"Saigon","lat":10.8142,"lon":106.6519,"freq":"362","region":"VV"},"HAN":{"type":"NDB","name":"Hanoi","lat":21.2008,"lon":105.7845,"freq":"361","region":"VV"},"BKI":{"type":"NDB","name":"Bangkok","lat":13.69,"lon":100.7501,"freq":"360","region":"VT"},"BCC":{"type":"NDB","name":"Colombo","lat":6.9271,"lon":80.7789,"freq":"372","region":"VC"},"CCJ":{"type":"NDB","name":"Cochin","lat":10.1522,"lon":76.2397,"freq":"379","region":"VI"},"KTM":{"type":"NDB","name":"Kathmandu","lat":27.6963,"lon":85.3595,"freq":"378","region":"VN"},"DAC":{"type":"NDB","name":"Dhaka","lat":23.8103,"lon":90.4036,"freq":"370","region":"VG"},"RGN":{"type":"NDB","name":"Rangoon","lat":16.9891,"lon":96.2014,"freq":"363","region":"VY"},"OTP":{"type":"NDB","name":"Otopeni Bucharest","lat":44.5711,"lon":26.085,"freq":"390","region":"LR"},"SJJ":{"type":"NDB","name":"Sarajevo","lat":43.8164,"lon":18.3319,"freq":"391","region":"LQ"},"BEG":{"type":"NDB","name":"Belgrade","lat":44.8184,"lon":20.2711,"freq":"389","region":"LY"},"BUD":{"type":"NDB","name":"Budapest","lat":47.4397,"lon":19.2582,"freq":"392","region":"LH"},"PRG":{"type":"NDB","name":"Prague","lat":50.1008,"lon":14.2658,"freq":"393","region":"LK"},"WAW":{"type":"NDB","name":"Warsaw","lat":52.1657,"lon":21.0012,"freq":"395","region":"EP"},"PLC":{"type":"NDB","name":"Palma Mallorca","lat":39.5469,"lon":2.7486,"freq":"397","region":"LE"},"AGP":{"type":"NDB","name":"Malaga","lat":36.6749,"lon":-3.7388,"freq":"398","region":"LE"},"IBZ":{"type":"NDB","name":"Ibiza","lat":38.8721,"lon":1.373,"freq":"399","region":"LE"},"VLC":{"type":"NDB","name":"Valencia","lat":39.4891,"lon":-0.4817,"freq":"374","region":"LE"},"CDT":{"type":"NDB","name":"Candela Barcelona","lat":41.2971,"lon":2.0578,"freq":"348","region":"LE"},"TFS":{"type":"NDB","name":"Tenerife","lat":28.2744,"lon":-16.2466,"freq":"401","region":"LE"},"LPA":{"type":"NDB","name":"Gran Canaria NDB","lat":27.9319,"lon":-15.3868,"freq":"343","region":"LE"},"SCV":{"type":"NDB","name":"Seville","lat":37.4169,"lon":-5.8929,"freq":"403","region":"LE"},"SVQ":{"type":"NDB","name":"Seville VOR NDB","lat":37.4169,"lon":-5.8929,"freq":"404","region":"LE"},"OPO":{"type":"NDB","name":"Porto","lat":41.2081,"lon":-8.6814,"freq":"340","region":"LP"},"FNC":{"type":"NDB","name":"Funchal Madeira","lat":32.6975,"lon":-17.0139,"freq":"341","region":"LP"},"MIL":{"type":"NDB","name":"Milan Malpensa","lat":45.6306,"lon":8.7281,"freq":"350","region":"LI"},"MCE":{"type":"NDB","name":"Milan Linate","lat":45.4626,"lon":9.2711,"freq":"351","region":"LI"},"BGY":{"type":"NDB","name":"Bergamo","lat":45.6733,"lon":9.7053,"freq":"352","region":"LI"},"VCE":{"type":"NDB","name":"Venice","lat":45.505,"lon":12.2519,"freq":"353","region":"LI"},"BLQ":{"type":"NDB","name":"Bologna","lat":44.5358,"lon":11.2889,"freq":"354","region":"LI"},"PMO":{"type":"NDB","name":"Palermo","lat":37.6213,"lon":13.0961,"freq":"355","region":"LI"},"CTA":{"type":"NDB","name":"Catania","lat":37.4669,"lon":15.0724,"freq":"356","region":"LI"},"MXP":{"type":"NDB","name":"Malpensa","lat":45.6306,"lon":8.7281,"freq":"357","region":"LI"},"GVA":{"type":"NDB","name":"Geneva","lat":46.2381,"lon":6.1093,"freq":"358","region":"LS"},"BSL":{"type":"NDB","name":"Basel","lat":47.5896,"lon":7.5296,"freq":"359","region":"LS"},"ZRH":{"type":"NDB","name":"Zurich NDB","lat":47.4647,"lon":8.5492,"freq":"360","region":"LS"},"VIE":{"type":"NDB","name":"Vienna","lat":48.1102,"lon":16.5697,"freq":"361","region":"LO"},"BRN":{"type":"NDB","name":"Bern","lat":46.9121,"lon":7.6167,"freq":"362","region":"LS"},"KBP":{"type":"NDB","name":"Kyiv Boryspil","lat":50.345,"lon":30.8947,"freq":"363","region":"UK"},"UUA":{"type":"NDB","name":"Kyiv Zhuliany","lat":50.4013,"lon":30.4519,"freq":"364","region":"UK"},"SVX":{"type":"NDB","name":"Yekaterinburg","lat":56.7431,"lon":60.8025,"freq":"365","region":"UW"},"OVB":{"type":"NDB","name":"Novosibirsk","lat":55.0115,"lon":82.6597,"freq":"366","region":"UU"},"HNA":{"type":"NDB","name":"Hanoi NDB","lat":21.2008,"lon":105.7845,"freq":"367","region":"VV"},"SGW":{"type":"NDB","name":"Saigon NDB","lat":10.8142,"lon":106.6519,"freq":"368","region":"VV"},"PHS":{"type":"NDB","name":"Phoenix Sky Harbor","lat":33.4484,"lon":-112.0742,"freq":"270","region":"K"},"TUS":{"type":"NDB","name":"Tucson","lat":32.1163,"lon":-110.9411,"freq":"271","region":"K"},"ABQ":{"type":"NDB","name":"Albuquerque","lat":35.0402,"lon":-106.6366,"freq":"272","region":"K"},"ELP":{"type":"NDB","name":"El Paso","lat":31.8074,"lon":-106.3775,"freq":"273","region":"K"},"AUS":{"type":"NDB","name":"Austin","lat":30.2946,"lon":-97.7205,"freq":"274","region":"K"},"SAT":{"type":"NDB","name":"San Antonio","lat":29.5337,"lon":-98.4696,"freq":"275","region":"K"},"CRP":{"type":"NDB","name":"Corpus Christi","lat":27.7698,"lon":-97.5008,"freq":"276","region":"K"},"HRL":{"type":"NDB","name":"Harlingen","lat":26.226,"lon":-97.6545,"freq":"277","region":"K"},"BZE":{"type":"NDB","name":"Belize","lat":17.2505,"lon":-88.7589,"freq":"278","region":"MZ"},"TGU":{"type":"NDB","name":"Tegucigalpa","lat":14.0627,"lon":-87.1922,"freq":"279","region":"MH"},"MGA":{"type":"NDB","name":"Managua","lat":12.1483,"lon":-86.1676,"freq":"280","region":"MN"},"PAP":{"type":"NDB","name":"Port au Prince","lat":18.5734,"lon":-72.2956,"freq":"281","region":"MD"},"HAI":{"type":"NDB","name":"Santiago Dominican Republic","lat":19.3704,"lon":-70.3006,"freq":"282","region":"MD"},"PUJ":{"type":"NDB","name":"Punta Cana","lat":18.567,"lon":-68.3906,"freq":"283","region":"MD"}},"fixes":{"NATU":{"lat":51.5,"lon":-15.0,"region":"EG"},"NEBIN":{"lat":51.45,"lon":-14.5,"region":"EG"},"LIMRI":{"lat":51.2,"lon":-10.0,"region":"EG"},"XAMAN":{"lat":51.0,"lon":-8.5,"region":"EG"},"PIKIL":{"lat":50.5,"lon":-5.0,"region":"EG"},"ELSIR":{"lat":50.0,"lon":-2.0,"region":"EG"},"GOMUP":{"lat":49.5,"lon":0.5,"region":"EG"},"ETIKI":{"lat":49.0,"lon":3.0,"region":"LF"},"DOGAL":{"lat":48.0,"lon":5.0,"region":"LF"},"BABAN":{"lat":47.0,"lon":7.0,"region":"LS"},"LOACH":{"lat":46.5,"lon":8.0,"region":"LS"},"GIPER":{"lat":45.5,"lon":10.0,"region":"LI"},"RESNO":{"lat":44.5,"lon":12.0,"region":"LI"},"VIXUN":{"lat":43.5,"lon":14.0,"region":"LI"},"MUSAK":{"lat":42.5,"lon":15.0,"region":"LI"},"MALOT":{"lat":41.5,"lon":17.0,"region":"LG"},"ALLRY":{"lat":40.5,"lon":19.0,"region":"LG"},"SEPAL":{"lat":39.5,"lon":21.0,"region":"LG"},"BERTH":{"lat":38.5,"lon":23.0,"region":"LG"},"SLATN":{"lat":37.5,"lon":25.0,"region":"LT"},"COLOR":{"lat":36.5,"lon":27.0,"region":"LT"},"DEVAL":{"lat":35.5,"lon":29.0,"region":"LT"},"TUSKY":{"lat":34.5,"lon":31.0,"region":"HE"},"CYMON":{"lat":33.5,"lon":33.0,"region":"HE"},"HOIST":{"lat":32.5,"lon":35.0,"region":"OE"},"STEAM":{"lat":31.5,"lon":37.0,"region":"OE"},"MERIT":{"lat":51.8669,"lon":-0.4208,"region":"EG"},"TALLA":{"lat":51.9083,"lon":-1.0,"region":"EG"},"BUZAD":{"lat":52.0,"lon":-1.5,"region":"EG"},"DESAP":{"lat":52.1,"lon":-2.0,"region":"EG"},"ADNID":{"lat":52.2,"lon":-2.5,"region":"EG"},"ROKIL":{"lat":52.3,"lon":-3.0,"region":"EG"},"GOXUL":{"lat":52.4,"lon":-3.5,"region":"EG"},"MODMI":{"lat":52.5,"lon":-4.0,"region":"EG"},"NUGRA":{"lat":52.6,"lon":-4.5,"region":"EG"},"TOPPA":{"lat":52.7,"lon":-5.0,"region":"EG"},"KIDLI":{"lat":52.8,"lon":-5.5,"region":"EG"},"RIBEL":{"lat":52.9,"lon":-6.0,"region":"EG"},"SOXER":{"lat":53.0,"lon":-6.5,"region":"EG"},"KONOL":{"lat":53.1,"lon":-7.0,"region":"EG"},"ZAGRO":{"lat":53.2,"lon":-7.5,"region":"EG"},"AMLEV":{"lat":53.3,"lon":-8.0,"region":"EG"},"DIWUN":{"lat":53.4,"lon":-8.5,"region":"EG"},"XIDIL":{"lat":53.5,"lon":-9.0,"region":"EG"},"BAKUR":{"lat":53.6,"lon":-9.5,"region":"EG"},"BASNO":{"lat":53.7,"lon":-10.0,"region":"EG"},"CUNOP":{"lat":53.8,"lon":-10.5,"region":"EG"},"DINIM":{"lat":53.9,"lon":-11.0,"region":"EG"},"ELMUR":{"lat":54.0,"lon":-11.5,"region":"EG"},"FOSVA":{"lat":54.1,"lon":-12.0,"region":"EG"},"GADSI":{"lat":54.2,"lon":-12.5,"region":"EG"},"HOKIL":{"lat":54.3,"lon":-13.0,"region":"EG"},"INKUR":{"lat":54.4,"lon":-13.5,"region":"EG"},"JOLNO":{"lat":54.5,"lon":-14.0,"region":"EG"},"KILMU":{"lat":54.6,"lon":-14.5,"region":"EG"},"LUNOP":{"lat":54.7,"lon":-15.0,"region":"EG"},"MONAB":{"lat":54.8,"lon":-15.5,"region":"EG"},"NIPRU":{"lat":54.9,"lon":-16.0,"region":"EG"},"OGDIT":{"lat":55.0,"lon":-16.5,"region":"EG"},"PUDEL":{"lat":55.1,"lon":-17.0,"region":"EG"},"RIDMU":{"lat":55.2,"lon":-17.5,"region":"EG"},"SAPNO":{"lat":55.3,"lon":-18.0,"region":"EG"},"TIDUR":{"lat":55.4,"lon":-18.5,"region":"EG"},"UVROP":{"lat":55.5,"lon":-19.0,"region":"EG"},"VIDEL":{"lat":55.6,"lon":-19.5,"region":"EG"},"WOXIN":{"lat":55.7,"lon":-20.0,"region":"EG"},"XIMBO":{"lat":55.8,"lon":-20.5,"region":"EG"},"YUGOR":{"lat":55.9,"lon":-21.0,"region":"EG"},"ZIBEL":{"lat":56.0,"lon":-21.5,"region":"EG"},"KONAN":{"lat":51.55,"lon":0.5,"region":"EG"},"ORTAC":{"lat":50.15,"lon":-2.5,"region":"EG"},"KATHY":{"lat":49.8,"lon":-2.0,"region":"EG"},"SITET":{"lat":49.5,"lon":-1.5,"region":"EG"},"NATEB":{"lat":49.2,"lon":-1.0,"region":"LF"},"SAPCO":{"lat":48.9,"lon":-0.5,"region":"LF"},"ASKEY":{"lat":48.6,"lon":0.0,"region":"LF"},"RODNI":{"lat":48.3,"lon":0.5,"region":"LF"},"LOGAN":{"lat":48.0,"lon":1.0,"region":"LF"},"LEDBO":{"lat":47.7,"lon":1.5,"region":"LF"},"GISNO":{"lat":47.4,"lon":2.0,"region":"LF"},"SOSIM":{"lat":47.1,"lon":2.5,"region":"LF"},"MAKUX":{"lat":46.8,"lon":3.0,"region":"LS"},"PELIG":{"lat":46.5,"lon":3.5,"region":"LS"},"DENUT":{"lat":46.2,"lon":4.0,"region":"LS"},"CAMRN":{"lat":40.5,"lon":-74.0,"region":"K"},"BETTE":{"lat":40.3,"lon":-73.5,"region":"K"},"RANCE":{"lat":40.1,"lon":-73.0,"region":"K"},"GRAYM":{"lat":39.9,"lon":-72.5,"region":"K"},"HAFNR":{"lat":39.7,"lon":-72.0,"region":"K"},"WAVEY":{"lat":39.5,"lon":-71.5,"region":"K"},"DOTTY":{"lat":39.3,"lon":-71.0,"region":"K"},"CLVIN":{"lat":39.1,"lon":-70.5,"region":"K"},"NEWEL":{"lat":38.9,"lon":-70.0,"region":"K"},"ROBUC":{"lat":38.7,"lon":-69.5,"region":"K"},"SOPIN":{"lat":35.5,"lon":-97.5,"region":"K"},"TULSA":{"lat":36.2,"lon":-95.9,"region":"K"},"PONCA":{"lat":36.7,"lon":-94.3,"region":"K"},"MEMPH":{"lat":35.1,"lon":-90.0,"region":"K"},"LOUIS":{"lat":38.75,"lon":-90.37,"region":"K"},"GIBBZ":{"lat":40.5,"lon":-88.0,"region":"K"},"SKIPO":{"lat":41.5,"lon":-87.0,"region":"K"},"MIDIM":{"lat":43.0,"lon":-85.0,"region":"K"},"COLEM":{"lat":44.0,"lon":-83.0,"region":"K"},"CLARD":{"lat":45.0,"lon":-81.0,"region":"K"},"DAVOW":{"lat":46.0,"lon":-79.0,"region":"K"},"ESSEX":{"lat":43.3,"lon":-82.5,"region":"K"},"AMMON":{"lat":43.1,"lon":-111.5,"region":"K"},"HAZEL":{"lat":39.0,"lon":-111.5,"region":"K"},"PROVO":{"lat":40.2,"lon":-111.6,"region":"K"},"MONTI":{"lat":41.9,"lon":-111.8,"region":"K"},"ALTAM":{"lat":42.5,"lon":-111.0,"region":"K"},"BELLE":{"lat":44.5,"lon":-108.0,"region":"K"},"GREND":{"lat":43.5,"lon":-106.0,"region":"K"},"MOREY":{"lat":43.0,"lon":-104.0,"region":"K"},"LAMAR":{"lat":38.1,"lon":-102.5,"region":"K"},"PHENS":{"lat":33.5,"lon":-112.0,"region":"K"},"GILSE":{"lat":33.4,"lon":-111.3,"region":"K"},"LUCIN":{"lat":41.8,"lon":-113.7,"region":"K"},"PINTA":{"lat":40.3,"lon":-114.3,"region":"K"},"GALLO":{"lat":39.5,"lon":-117.0,"region":"K"},"MELOW":{"lat":37.8,"lon":-119.0,"region":"K"},"TAHOE":{"lat":38.9,"lon":-120.0,"region":"K"},"NEXUS":{"lat":37.5,"lon":-121.5,"region":"K"},"SUNOL":{"lat":37.6,"lon":-121.8,"region":"K"},"CESTA":{"lat":36.8,"lon":-122.3,"region":"K"},"SABLE":{"lat":36.0,"lon":-121.0,"region":"K"},"ACTON":{"lat":34.5,"lon":-118.2,"region":"K"},"DALEA":{"lat":33.9,"lon":-117.3,"region":"K"},"GORDO":{"lat":33.3,"lon":-116.4,"region":"K"},"PALMS":{"lat":34.7,"lon":-116.5,"region":"K"},"RMNTS":{"lat":34.0,"lon":-115.6,"region":"K"},"SHADY":{"lat":37.5,"lon":-116.0,"region":"K"},"MORNT":{"lat":35.8,"lon":-115.0,"region":"K"},"BORON":{"lat":34.5,"lon":-117.9,"region":"K"},"VISTA":{"lat":33.2,"lon":-117.2,"region":"K"},"BAYST":{"lat":32.7,"lon":-116.5,"region":"K"},"CAJON":{"lat":34.0,"lon":-117.4,"region":"K"},"DEXTR":{"lat":34.6,"lon":-117.8,"region":"K"},"MINAS":{"lat":34.8,"lon":-118.1,"region":"K"},"OCEAN":{"lat":34.5,"lon":-119.5,"region":"K"},"PEDGE":{"lat":33.9,"lon":-118.3,"region":"K"},"RUSTY":{"lat":33.0,"lon":-117.0,"region":"K"},"SANDI":{"lat":32.7,"lon":-117.2,"region":"K"},"TRANG":{"lat":32.5,"lon":-117.0,"region":"K"},"UPLAND":{"lat":34.1,"lon":-117.6,"region":"K"}},"airways":{"NAT-A":{"type":"high","fixes":[]},"NAT-B":{"type":"high","fixes":[]},"NAT-C":{"type":"high","fixes":[]},"NAT-D":{"type":"high","fixes":[]},"NAT-E":{"type":"high","fixes":[]},"NAT-F":{"type":"high","fixes":[]},"NAT-G":{"type":"high","fixes":[]},"NAT-H":{"type":"high","fixes":[]},"NAT-I":{"type":"high","fixes":[]},"NAT-J":{"type":"high","fixes":[]},"NAT-K":{"type":"high","fixes":[]},"NAT-L":{"type":"high","fixes":[]},"NAT-M":{"type":"high","fixes":[]},"NAT-N":{"type":"high","fixes":[]},"NAT-O":{"type":"high","fixes":[]},"NAT-P":{"type":"high","fixes":[]},"NAT-Q":{"type":"high","fixes":[]},"NAT-R":{"type":"high","fixes":[]},"NAT-S":{"type":"high","fixes":[]},"NAT-T":{"type":"high","fixes":[]},"NAT-U":{"type":"high","fixes":[]},"NAT-V":{"type":"high","fixes":[]},"NAT-W":{"type":"high","fixes":[]},"NAT-X":{"type":"high","fixes":[]},"NAT-Y":{"type":"high","fixes":[]},"NAT-Z":{"type":"high","fixes":[]},"UL612":{"type":"high","fixes":["GOW","TALLA","MERIT","BUZAD","DESAP"]},"UL9":{"type":"high","fixes":["DVR","ASKEY","NATEB"]},"UL607":{"type":"high","fixes":["LON","KONAN","LOGASN"]},"UN601":{"type":"high","fixes":["BPK","RODNI","LEDBO"]},"UP6":{"type":"high","fixes":["SAM","GISNO","SOSIM"]},"UN610":{"type":"high","fixes":["LAM","DET","MAKUX"]},"UT420":{"type":"both","fixes":["HON","BUB","PELIG"]},"UY53":{"type":"low","fixes":["BHD","STN","DENUT"]},"UB4":{"type":"low","fixes":["DVR","NIK","NTM"]},"UL610":{"type":"high","fixes":["OCK","SPI","ORTAC"]},"UM185":{"type":"high","fixes":["FRA","MUN","ZUR"]},"UM604":{"type":"high","fixes":["AMS","BRU","CDG"]},"UP2":{"type":"high","fixes":["MAD","FCO","ATH"]},"UQ4":{"type":"both","fixes":["LIS","CMN","CAI"]},"UR1":{"type":"high","fixes":["IST","DXB","MCT"]},"UT10":{"type":"both","fixes":["RUH","JED","BAH"]},"J6":{"type":"low","fixes":["JFK","CAMRN","BETTE"]},"J75":{"type":"low","fixes":["LAX","MELOW","TAHOE"]},"J80":{"type":"low","fixes":["ORD","GIBBZ","SKIPO"]},"J121":{"type":"low","fixes":["ATL","MEMPH","LOUIS"]},"J146":{"type":"low","fixes":["DFW","TULSA","SOPIN"]},"J148":{"type":"low","fixes":["BOS","EWR","ESSEX"]},"J150":{"type":"low","fixes":["SFO","ACTON","DALEA"]},"J174":{"type":"low","fixes":["MIA","DOTTY","CLVIN"]},"J190":{"type":"low","fixes":["SEA","LUCIN","PINTA"]},"Q113":{"type":"low","fixes":["DEN","LAMAR","MOREY"]},"Q64":{"type":"low","fixes":["PHX","GALLO","RMNTS"]},"Q75":{"type":"low","fixes":["LAS","SHADY","MORNT"]},"A1":{"type":"both","fixes":["NRT","HND","HKG"]},"A17":{"type":"both","fixes":["PEK","PVG","SIN"]},"A202":{"type":"both","fixes":["BKK","ICN","KUL"]},"A338":{"type":"both","fixes":["MNL","DEL","BOM"]},"A457":{"type":"both","fixes":["SYD","MEL","AKL"]},"A576":{"type":"both","fixes":["BNE","PER","GRU"]},"B339":{"type":"both","fixes":["EZE","BOG","SCL"]},"G215":{"type":"both","fixes":["LIM","JNB","CPT"]},"L507":{"type":"low","fixes":["NBO","CAI","CMN"]},"L888":{"type":"low","fixes":["ADD","LOS","MIA"]},"M771":{"type":"both","fixes":["YVR","YYC","YEG"]},"N644":{"type":"both","fixes":["YWG","YYZ","YUL"]},"P574":{"type":"both","fixes":["YHZ","MEX","CUN"]},"R216":{"type":"both","fixes":["LAP","DAVOW","CLARD"]},"T112":{"type":"both","fixes":["DAL","HOU","DCA"]},"V1":{"type":"low","fixes":["CLT","PHL","DTW"]}}};
+  // Cycle metadata is auto-computed; navaid/fix/airway data is static reference.
+  const _airac = computeCurrentAirac();
+  const NAVDATA = {"cycle":_airac.cycle,"effective":_airac.effective,"expires":_airac.expires,"source":"auto-computed-v2","navaids":{"JFK":{"type":"VOR","name":"New York Kennedy","lat":40.6413,"lon":-73.7781,"freq":"115.9","region":"K"},"LAX":{"type":"VOR","name":"Los Angeles International","lat":33.9425,"lon":-118.4081,"freq":"113.6","region":"K"},"ORD":{"type":"VOR","name":"Chicago O'Hare","lat":41.9742,"lon":-87.9073,"freq":"113.9","region":"K"},"ATL":{"type":"VOR","name":"Atlanta Hartsfield","lat":33.6407,"lon":-84.4277,"freq":"116.9","region":"K"},"DFW":{"type":"VOR","name":"Dallas Fort Worth","lat":32.8975,"lon":-97.038,"freq":"117.0","region":"K"},"BOS":{"type":"VOR","name":"Boston Logan","lat":42.3656,"lon":-71.0096,"freq":"112.7","region":"K"},"SFO":{"type":"VOR","name":"San Francisco International","lat":37.6213,"lon":-122.379,"freq":"115.8","region":"K"},"MIA":{"type":"VOR","name":"Miami International","lat":25.7959,"lon":-80.287,"freq":"115.9","region":"K"},"SEA":{"type":"VOR","name":"Seattle Tacoma","lat":47.4502,"lon":-122.3088,"freq":"116.8","region":"K"},"DEN":{"type":"NDB","name":"Delhi NDB","lat":28.5673,"lon":77.1025,"freq":"381","region":"VI"},"IAD":{"type":"VOR","name":"Washington Dulles","lat":38.8951,"lon":-77.4373,"freq":"113.3","region":"K"},"CLT":{"type":"VOR","name":"Charlotte Douglas","lat":35.214,"lon":-80.9431,"freq":"114.5","region":"K"},"PHL":{"type":"VOR","name":"Philadelphia International","lat":39.8744,"lon":-75.2424,"freq":"108.2","region":"K"},"DTW":{"type":"VOR","name":"Detroit Metropolitan","lat":42.2124,"lon":-83.3534,"freq":"113.6","region":"K"},"MSP":{"type":"VOR","name":"Minneapolis Saint Paul","lat":44.8844,"lon":-93.2218,"freq":"115.3","region":"K"},"BWI":{"type":"VOR","name":"Baltimore Washington","lat":39.1754,"lon":-76.6685,"freq":"115.5","region":"K"},"MCO":{"type":"VOR","name":"Orlando International","lat":28.4312,"lon":-81.3089,"freq":"112.2","region":"K"},"EWR":{"type":"VOR","name":"Newark","lat":40.6895,"lon":-74.1745,"freq":"115.3","region":"K"},"HPN":{"type":"VOR","name":"Westchester County","lat":41.0534,"lon":-73.8678,"freq":"110.4","region":"K"},"AGC":{"type":"VOR","name":"Pittsburgh Allegheny County","lat":40.3545,"lon":-79.9303,"freq":"110.0","region":"K"},"LAS":{"type":"VOR","name":"Las Vegas","lat":36.08,"lon":-115.1617,"freq":"113.1","region":"K"},"PHX":{"type":"VOR","name":"Phoenix Sky Harbor","lat":33.4484,"lon":-112.0742,"freq":"115.1","region":"K"},"DAL":{"type":"VOR","name":"Dallas Love Field","lat":32.8472,"lon":-96.8374,"freq":"114.4","region":"K"},"HOU":{"type":"VOR","name":"Houston","lat":29.6435,"lon":-95.2794,"freq":"114.9","region":"K"},"DCA":{"type":"VOR","name":"Washington Reagan","lat":38.8516,"lon":-77.0375,"freq":"117.2","region":"K"},"LON":{"type":"VOR","name":"London","lat":51.4785,"lon":-0.4569,"freq":"113.6","region":"EG"},"SAM":{"type":"VOR","name":"Sammy","lat":51.6166,"lon":-0.25,"freq":"113.35","region":"EG"},"BPK":{"type":"VOR","name":"Brookman's Park","lat":51.7797,"lon":-0.2086,"freq":"117.5","region":"EG"},"LAM":{"type":"VOR","name":"Lambourne","lat":51.5547,"lon":0.4072,"freq":"110.85","region":"EG"},"OCK":{"type":"VOR","name":"Ockham","lat":51.35,"lon":-0.5086,"freq":"115.3","region":"EG"},"DET":{"type":"VOR","name":"Detling","lat":51.3097,"lon":0.6239,"freq":"115.15","region":"EG"},"HON":{"type":"VOR","name":"Honiley","lat":52.1814,"lon":-1.6869,"freq":"113.65","region":"EG"},"BHD":{"type":"VOR","name":"Bovingdon","lat":51.7436,"lon":-0.5361,"freq":"112.05","region":"EG"},"STN":{"type":"VOR","name":"Stansted","lat":51.8847,"lon":0.2381,"freq":"117.1","region":"EG"},"DVR":{"type":"VOR","name":"Daventry","lat":52.3,"lon":-1.3894,"freq":"114.95","region":"EG"},"GOW":{"type":"VOR","name":"Goodwood","lat":50.8614,"lon":-0.6325,"freq":"114.3","region":"EG"},"TLA":{"type":"VOR","name":"Tulla","lat":52.7636,"lon":-8.6425,"freq":"114.9","region":"EI"},"POL":{"type":"VOR","name":"Pole Hill","lat":54.9169,"lon":-2.1814,"freq":"112.1","region":"EG"},"KOK":{"type":"VOR","name":"Koksy","lat":55.0,"lon":-3.5,"freq":"114.5","region":"EG"},"SPI":{"type":"VOR","name":"Spitfire","lat":50.83,"lon":1.05,"freq":"113.0","region":"EG"},"BUB":{"type":"VOR","name":"Bubbenhall","lat":52.15,"lon":-1.55,"freq":"114.85","region":"EG"},"NIK":{"type":"VOR","name":"Nikki","lat":53.8,"lon":-2.25,"freq":"115.35","region":"EG"},"NTM":{"type":"VOR","name":"Nottingham","lat":52.9047,"lon":-1.25,"freq":"116.05","region":"EG"},"CDG":{"type":"VOR","name":"Paris Charles de Gaulle","lat":49.0097,"lon":2.5497,"freq":"115.35","region":"LF"},"FRA":{"type":"VOR","name":"Frankfurt","lat":50.0264,"lon":8.5636,"freq":"114.2","region":"ED"},"AMS":{"type":"VOR","name":"Amsterdam","lat":52.3086,"lon":4.7639,"freq":"108.4","region":"EH"},"MAD":{"type":"VOR","name":"Madrid","lat":40.4165,"lon":-3.6891,"freq":"112.5","region":"LE"},"FCO":{"type":"VOR","name":"Rome Fiumicino","lat":41.8002,"lon":12.2388,"freq":"113.6","region":"LI"},"MUN":{"type":"VOR","name":"Munich","lat":48.3538,"lon":11.7861,"freq":"112.3","region":"ED"},"ZUR":{"type":"VOR","name":"Zurich","lat":47.4647,"lon":8.5492,"freq":"116.05","region":"LS"},"BRU":{"type":"VOR","name":"Brussels","lat":50.901,"lon":4.4856,"freq":"114.6","region":"EB"},"LIS":{"type":"NDB","name":"Lisbon NDB","lat":38.6813,"lon":-9.1366,"freq":"342","region":"LP"},"ATH":{"type":"VOR","name":"Athens","lat":37.9364,"lon":23.9445,"freq":"112.4","region":"LG"},"IST":{"type":"VOR","name":"Istanbul","lat":41.2619,"lon":28.748,"freq":"116.2","region":"LT"},"DXB":{"type":"VOR","name":"Dubai","lat":25.2528,"lon":55.3643,"freq":"114.4","region":"OM"},"DOH":{"type":"VOR","name":"Doha","lat":25.2711,"lon":51.5536,"freq":"116.1","region":"OO"},"JED":{"type":"VOR","name":"Jeddah","lat":21.5169,"lon":39.1686,"freq":"110.5","region":"OE"},"BAH":{"type":"NDB","name":"Bahamas NDB","lat":26.2,"lon":-76.6,"freq":"394","region":"MB"},"AUH":{"type":"VOR","name":"Abu Dhabi","lat":24.433,"lon":54.6511,"freq":"113.3","region":"OM"},"KWI":{"type":"VOR","name":"Kuwait","lat":29.3759,"lon":47.9774,"freq":"114.2","region":"OK"},"RUH":{"type":"VOR","name":"Riyadh","lat":24.7258,"lon":46.6988,"freq":"113.2","region":"OE"},"MCT":{"type":"VOR","name":"Muscat","lat":23.5933,"lon":58.2842,"freq":"116.0","region":"OM"},"NRT":{"type":"VOR","name":"Narita Tokyo","lat":35.7653,"lon":140.3931,"freq":"112.4","region":"RJ"},"HND":{"type":"VOR","name":"Haneda Tokyo","lat":35.5494,"lon":139.7798,"freq":"112.2","region":"RJ"},"PEK":{"type":"VOR","name":"Beijing Capital","lat":40.0801,"lon":116.5847,"freq":"113.0","region":"ZB"},"PVG":{"type":"VOR","name":"Shanghai Pudong","lat":31.1437,"lon":121.805,"freq":"113.6","region":"ZS"},"HKG":{"type":"VOR","name":"Hong Kong","lat":22.3193,"lon":113.915,"freq":"113.35","region":"ZH"},"SIN":{"type":"VOR","name":"Singapore","lat":1.3521,"lon":103.8198,"freq":"112.5","region":"WS"},"BKK":{"type":"VOR","name":"Bangkok Suvarnabhumi","lat":13.69,"lon":100.7501,"freq":"116.0","region":"VT"},"ICN":{"type":"VOR","name":"Incheon Seoul","lat":37.4602,"lon":126.4407,"freq":"113.9","region":"RK"},"KUL":{"type":"VOR","name":"Kuala Lumpur","lat":2.7258,"lon":101.7103,"freq":"114.3","region":"WM"},"MNL":{"type":"VOR","name":"Manila Ninoy Aquino","lat":14.1895,"lon":121.0187,"freq":"114.2","region":"RP"},"DEL":{"type":"VOR","name":"Delhi Indira Gandhi","lat":28.5673,"lon":77.1025,"freq":"115.0","region":"VI"},"BOM":{"type":"NDB","name":"Bombay NDB","lat":19.0896,"lon":72.8656,"freq":"380","region":"VI"},"SYD":{"type":"VOR","name":"Sydney","lat":-33.9461,"lon":151.1772,"freq":"115.3","region":"Y"},"MEL":{"type":"VOR","name":"Melbourne","lat":-37.669,"lon":144.841,"freq":"114.1","region":"Y"},"AKL":{"type":"VOR","name":"Auckland","lat":-37.0082,"lon":174.7917,"freq":"113.7","region":"NZ"},"BNE":{"type":"VOR","name":"Brisbane","lat":-27.3842,"lon":153.1175,"freq":"112.1","region":"Y"},"PER":{"type":"VOR","name":"Perth","lat":-31.9403,"lon":115.9674,"freq":"113.7","region":"Y"},"GRU":{"type":"VOR","name":"Sao Paulo Guarulhos","lat":-23.4356,"lon":-46.4731,"freq":"114.3","region":"SB"},"EZE":{"type":"VOR","name":"Buenos Aires Ezeiza","lat":-34.8222,"lon":-58.5358,"freq":"115.5","region":"SA"},"BOG":{"type":"VOR","name":"Bogota El Dorado","lat":4.7016,"lon":-74.1479,"freq":"113.5","region":"SK"},"SCL":{"type":"VOR","name":"Santiago","lat":-33.3869,"lon":-70.3852,"freq":"113.9","region":"SC"},"LIM":{"type":"VOR","name":"Lima Jorge Chavez","lat":-12.0219,"lon":-77.109,"freq":"113.5","region":"SP"},"JNB":{"type":"VOR","name":"Johannesburg","lat":-26.1367,"lon":28.2411,"freq":"114.3","region":"FA"},"CPT":{"type":"VOR","name":"Cape Town","lat":-33.9249,"lon":18.6024,"freq":"112.3","region":"FA"},"NBO":{"type":"VOR","name":"Nairobi","lat":-1.3192,"lon":36.7478,"freq":"114.3","region":"HK"},"CAI":{"type":"VOR","name":"Cairo","lat":30.1219,"lon":31.4056,"freq":"112.3","region":"HE"},"CMN":{"type":"VOR","name":"Casablanca","lat":33.3675,"lon":-7.5898,"freq":"114.5","region":"GMMC"},"ADD":{"type":"VOR","name":"Addis Ababa","lat":9.0265,"lon":38.7469,"freq":"113.3","region":"HA"},"LOS":{"type":"VOR","name":"Lagos","lat":6.5769,"lon":3.3212,"freq":"112.3","region":"DN"},"YYJ":{"type":"VOR","name":"Victoria","lat":48.6432,"lon":-123.4251,"freq":"115.6","region":"CY"},"YVR":{"type":"VOR","name":"Vancouver","lat":49.1951,"lon":-123.1829,"freq":"111.0","region":"CY"},"YYC":{"type":"VOR","name":"Calgary","lat":51.1215,"lon":-114.0147,"freq":"115.0","region":"CY"},"YEG":{"type":"VOR","name":"Edmonton","lat":53.3097,"lon":-113.5794,"freq":"113.5","region":"CY"},"YWG":{"type":"VOR","name":"Winnipeg","lat":49.92,"lon":-97.2383,"freq":"116.3","region":"CY"},"YYZ":{"type":"VOR","name":"Toronto","lat":43.6773,"lon":-79.6301,"freq":"114.9","region":"CY"},"YUL":{"type":"VOR","name":"Montreal","lat":45.4655,"lon":-73.7485,"freq":"113.3","region":"CY"},"YHZ":{"type":"VOR","name":"Halifax","lat":44.8844,"lon":-63.5094,"freq":"115.2","region":"CY"},"MEX":{"type":"VOR","name":"Mexico City","lat":19.4363,"lon":-99.0722,"freq":"115.5","region":"MM"},"CUN":{"type":"VOR","name":"Cancun","lat":21.0065,"lon":-86.8769,"freq":"116.9","region":"MM"},"LAP":{"type":"VOR","name":"La Paz","lat":24.0656,"lon":-110.2584,"freq":"112.8","region":"MM"},"MOA":{"type":"NDB","name":"Montego Bay","lat":18.5039,"lon":-77.9163,"freq":"387","region":"MJ"},"NAS":{"type":"NDB","name":"Nassau","lat":25.0517,"lon":-77.4705,"freq":"356","region":"MB"},"CTS":{"type":"NDB","name":"Chitose Sapporo","lat":42.7936,"lon":141.6525,"freq":"385","region":"RJ"},"KUX":{"type":"NDB","name":"Kansai Osaka","lat":34.4277,"lon":135.2342,"freq":"362","region":"RJ"},"IGO":{"type":"NDB","name":"Incheon Ground","lat":37.4502,"lon":126.4407,"freq":"368","region":"RK"},"HGH":{"type":"NDB","name":"Hangzhou","lat":30.2741,"lon":120.4343,"freq":"375","region":"ZS"},"PVD":{"type":"NDB","name":"Pudong Shanghai","lat":31.1437,"lon":121.805,"freq":"376","region":"ZS"},"CTU":{"type":"NDB","name":"Chengdu","lat":30.5728,"lon":104.0668,"freq":"374","region":"ZU"},"PEE":{"type":"NDB","name":"Peking","lat":40.0801,"lon":116.5847,"freq":"377","region":"ZB"},"SGN":{"type":"NDB","name":"Saigon","lat":10.8142,"lon":106.6519,"freq":"362","region":"VV"},"HAN":{"type":"NDB","name":"Hanoi","lat":21.2008,"lon":105.7845,"freq":"361","region":"VV"},"BKI":{"type":"NDB","name":"Bangkok","lat":13.69,"lon":100.7501,"freq":"360","region":"VT"},"BCC":{"type":"NDB","name":"Colombo","lat":6.9271,"lon":80.7789,"freq":"372","region":"VC"},"CCJ":{"type":"NDB","name":"Cochin","lat":10.1522,"lon":76.2397,"freq":"379","region":"VI"},"KTM":{"type":"NDB","name":"Kathmandu","lat":27.6963,"lon":85.3595,"freq":"378","region":"VN"},"DAC":{"type":"NDB","name":"Dhaka","lat":23.8103,"lon":90.4036,"freq":"370","region":"VG"},"RGN":{"type":"NDB","name":"Rangoon","lat":16.9891,"lon":96.2014,"freq":"363","region":"VY"},"OTP":{"type":"NDB","name":"Otopeni Bucharest","lat":44.5711,"lon":26.085,"freq":"390","region":"LR"},"SJJ":{"type":"NDB","name":"Sarajevo","lat":43.8164,"lon":18.3319,"freq":"391","region":"LQ"},"BEG":{"type":"NDB","name":"Belgrade","lat":44.8184,"lon":20.2711,"freq":"389","region":"LY"},"BUD":{"type":"NDB","name":"Budapest","lat":47.4397,"lon":19.2582,"freq":"392","region":"LH"},"PRG":{"type":"NDB","name":"Prague","lat":50.1008,"lon":14.2658,"freq":"393","region":"LK"},"WAW":{"type":"NDB","name":"Warsaw","lat":52.1657,"lon":21.0012,"freq":"395","region":"EP"},"PLC":{"type":"NDB","name":"Palma Mallorca","lat":39.5469,"lon":2.7486,"freq":"397","region":"LE"},"AGP":{"type":"NDB","name":"Malaga","lat":36.6749,"lon":-3.7388,"freq":"398","region":"LE"},"IBZ":{"type":"NDB","name":"Ibiza","lat":38.8721,"lon":1.373,"freq":"399","region":"LE"},"VLC":{"type":"NDB","name":"Valencia","lat":39.4891,"lon":-0.4817,"freq":"374","region":"LE"},"CDT":{"type":"NDB","name":"Candela Barcelona","lat":41.2971,"lon":2.0578,"freq":"348","region":"LE"},"TFS":{"type":"NDB","name":"Tenerife","lat":28.2744,"lon":-16.2466,"freq":"401","region":"LE"},"LPA":{"type":"NDB","name":"Gran Canaria NDB","lat":27.9319,"lon":-15.3868,"freq":"343","region":"LE"},"SCV":{"type":"NDB","name":"Seville","lat":37.4169,"lon":-5.8929,"freq":"403","region":"LE"},"SVQ":{"type":"NDB","name":"Seville VOR NDB","lat":37.4169,"lon":-5.8929,"freq":"404","region":"LE"},"OPO":{"type":"NDB","name":"Porto","lat":41.2081,"lon":-8.6814,"freq":"340","region":"LP"},"FNC":{"type":"NDB","name":"Funchal Madeira","lat":32.6975,"lon":-17.0139,"freq":"341","region":"LP"},"MIL":{"type":"NDB","name":"Milan Malpensa","lat":45.6306,"lon":8.7281,"freq":"350","region":"LI"},"MCE":{"type":"NDB","name":"Milan Linate","lat":45.4626,"lon":9.2711,"freq":"351","region":"LI"},"BGY":{"type":"NDB","name":"Bergamo","lat":45.6733,"lon":9.7053,"freq":"352","region":"LI"},"VCE":{"type":"NDB","name":"Venice","lat":45.505,"lon":12.2519,"freq":"353","region":"LI"},"BLQ":{"type":"NDB","name":"Bologna","lat":44.5358,"lon":11.2889,"freq":"354","region":"LI"},"PMO":{"type":"NDB","name":"Palermo","lat":37.6213,"lon":13.0961,"freq":"355","region":"LI"},"CTA":{"type":"NDB","name":"Catania","lat":37.4669,"lon":15.0724,"freq":"356","region":"LI"},"MXP":{"type":"NDB","name":"Malpensa","lat":45.6306,"lon":8.7281,"freq":"357","region":"LI"},"GVA":{"type":"NDB","name":"Geneva","lat":46.2381,"lon":6.1093,"freq":"358","region":"LS"},"BSL":{"type":"NDB","name":"Basel","lat":47.5896,"lon":7.5296,"freq":"359","region":"LS"},"ZRH":{"type":"NDB","name":"Zurich NDB","lat":47.4647,"lon":8.5492,"freq":"360","region":"LS"},"VIE":{"type":"NDB","name":"Vienna","lat":48.1102,"lon":16.5697,"freq":"361","region":"LO"},"BRN":{"type":"NDB","name":"Bern","lat":46.9121,"lon":7.6167,"freq":"362","region":"LS"},"KBP":{"type":"NDB","name":"Kyiv Boryspil","lat":50.345,"lon":30.8947,"freq":"363","region":"UK"},"UUA":{"type":"NDB","name":"Kyiv Zhuliany","lat":50.4013,"lon":30.4519,"freq":"364","region":"UK"},"SVX":{"type":"NDB","name":"Yekaterinburg","lat":56.7431,"lon":60.8025,"freq":"365","region":"UW"},"OVB":{"type":"NDB","name":"Novosibirsk","lat":55.0115,"lon":82.6597,"freq":"366","region":"UU"},"HNA":{"type":"NDB","name":"Hanoi NDB","lat":21.2008,"lon":105.7845,"freq":"367","region":"VV"},"SGW":{"type":"NDB","name":"Saigon NDB","lat":10.8142,"lon":106.6519,"freq":"368","region":"VV"},"PHS":{"type":"NDB","name":"Phoenix Sky Harbor","lat":33.4484,"lon":-112.0742,"freq":"270","region":"K"},"TUS":{"type":"NDB","name":"Tucson","lat":32.1163,"lon":-110.9411,"freq":"271","region":"K"},"ABQ":{"type":"NDB","name":"Albuquerque","lat":35.0402,"lon":-106.6366,"freq":"272","region":"K"},"ELP":{"type":"NDB","name":"El Paso","lat":31.8074,"lon":-106.3775,"freq":"273","region":"K"},"AUS":{"type":"NDB","name":"Austin","lat":30.2946,"lon":-97.7205,"freq":"274","region":"K"},"SAT":{"type":"NDB","name":"San Antonio","lat":29.5337,"lon":-98.4696,"freq":"275","region":"K"},"CRP":{"type":"NDB","name":"Corpus Christi","lat":27.7698,"lon":-97.5008,"freq":"276","region":"K"},"HRL":{"type":"NDB","name":"Harlingen","lat":26.226,"lon":-97.6545,"freq":"277","region":"K"},"BZE":{"type":"NDB","name":"Belize","lat":17.2505,"lon":-88.7589,"freq":"278","region":"MZ"},"TGU":{"type":"NDB","name":"Tegucigalpa","lat":14.0627,"lon":-87.1922,"freq":"279","region":"MH"},"MGA":{"type":"NDB","name":"Managua","lat":12.1483,"lon":-86.1676,"freq":"280","region":"MN"},"PAP":{"type":"NDB","name":"Port au Prince","lat":18.5734,"lon":-72.2956,"freq":"281","region":"MD"},"HAI":{"type":"NDB","name":"Santiago Dominican Republic","lat":19.3704,"lon":-70.3006,"freq":"282","region":"MD"},"PUJ":{"type":"NDB","name":"Punta Cana","lat":18.567,"lon":-68.3906,"freq":"283","region":"MD"},"ABE":{"type":"VOR","name":"Allentown","lat":40.7272,"lon":-75.4636,"freq":"111.0","region":"K"},"ACK":{"type":"VOR","name":"Nantucket","lat":41.2667,"lon":-70.0333,"freq":"116.2","region":"K"},"AGS":{"type":"VOR","name":"Augusta","lat":33.37,"lon":-81.9644,"freq":"116.1","region":"K"},"ALB":{"type":"VOR","name":"Albany","lat":42.7483,"lon":-73.8017,"freq":"115.3","region":"K"},"AML":{"type":"VOR","name":"Amelia","lat":37.6217,"lon":-77.5333,"freq":"117.5","region":"K"},"ARD":{"type":"VOR","name":"Ardmore","lat":39.9917,"lon":-75.3733,"freq":"108.2","region":"K"},"BAL":{"type":"VOR","name":"Baltimore","lat":39.175,"lon":-76.6683,"freq":"115.1","region":"K"},"BDL":{"type":"VOR","name":"Bradley","lat":41.9389,"lon":-72.6833,"freq":"109.0","region":"K"},"BGR":{"type":"VOR","name":"Bangor","lat":44.8017,"lon":-68.8283,"freq":"114.0","region":"K"},"BKW":{"type":"VOR","name":"Beckley","lat":37.7867,"lon":-81.125,"freq":"116.8","region":"K"},"BNA":{"type":"VOR","name":"Nashville","lat":36.1244,"lon":-86.6781,"freq":"114.1","region":"K"},"BRV":{"type":"VOR","name":"Bravo","lat":38.9783,"lon":-77.4583,"freq":"114.7","region":"K"},"CHS":{"type":"VOR","name":"Charleston","lat":32.8986,"lon":-80.0406,"freq":"115.2","region":"K"},"CLE":{"type":"VOR","name":"Cleveland","lat":41.4117,"lon":-81.85,"freq":"114.3","region":"K"},"CMH":{"type":"VOR","name":"Columbus","lat":39.9611,"lon":-82.9989,"freq":"114.3","region":"K"},"CRG":{"type":"VOR","name":"Craig","lat":30.3361,"lon":-81.5144,"freq":"114.5","region":"K"},"CVG":{"type":"VOR","name":"Covington","lat":39.0469,"lon":-84.6628,"freq":"117.3","region":"K"},"FLL":{"type":"VOR","name":"Fort Lauderdale","lat":26.0726,"lon":-80.1527,"freq":"109.6","region":"K"},"GNV":{"type":"VOR","name":"Gainesville","lat":29.6894,"lon":-82.2717,"freq":"116.2","region":"K"},"GSO":{"type":"VOR","name":"Greensboro","lat":36.0978,"lon":-79.9373,"freq":"113.5","region":"K"},"IAH":{"type":"VOR","name":"Houston Intercontinental","lat":29.9844,"lon":-95.3414,"freq":"116.6","region":"K"},"IND":{"type":"VOR","name":"Indianapolis","lat":39.7172,"lon":-86.2944,"freq":"116.3","region":"K"},"ISP":{"type":"VOR","name":"Islip","lat":40.7953,"lon":-73.1003,"freq":"116.9","region":"K"},"JAX":{"type":"VOR","name":"Jacksonville","lat":30.4944,"lon":-81.6878,"freq":"117.0","region":"K"},"LGA":{"type":"VOR","name":"LaGuardia","lat":40.7772,"lon":-73.8725,"freq":"113.1","region":"K"},"MCI":{"type":"VOR","name":"Kansas City","lat":39.2975,"lon":-94.7308,"freq":"112.6","region":"K"},"MDW":{"type":"VOR","name":"Chicago Midway","lat":41.7868,"lon":-87.7522,"freq":"113.5","region":"K"},"MEM":{"type":"VOR","name":"Memphis","lat":35.0424,"lon":-89.9767,"freq":"117.5","region":"K"},"MKE":{"type":"VOR","name":"Milwaukee","lat":42.9472,"lon":-87.8966,"freq":"113.0","region":"K"},"MSY":{"type":"VOR","name":"New Orleans","lat":29.9933,"lon":-90.2581,"freq":"113.2","region":"K"},"OKC":{"type":"VOR","name":"Oklahoma City","lat":35.393,"lon":-97.6006,"freq":"113.4","region":"K"},"ORL":{"type":"VOR","name":"Orlando Executive","lat":28.5455,"lon":-81.3327,"freq":"112.2","region":"K"},"PDX":{"type":"VOR","name":"Portland","lat":45.5886,"lon":-122.5975,"freq":"116.6","region":"K"},"PIT":{"type":"VOR","name":"Pittsburgh","lat":40.4914,"lon":-80.2328,"freq":"112.2","region":"K"},"RDU":{"type":"VOR","name":"Raleigh-Durham","lat":35.8776,"lon":-78.7875,"freq":"117.2","region":"K"},"RIC":{"type":"VOR","name":"Richmond","lat":37.5065,"lon":-77.3197,"freq":"114.1","region":"K"},"ROC":{"type":"VOR","name":"Rochester","lat":43.1188,"lon":-77.6722,"freq":"110.0","region":"K"},"RSW":{"type":"VOR","name":"Fort Myers","lat":26.5361,"lon":-81.7553,"freq":"110.2","region":"K"},"SAN":{"type":"VOR","name":"San Diego","lat":32.7336,"lon":-117.1892,"freq":"116.2","region":"K"},"SAV":{"type":"VOR","name":"Savannah","lat":32.1272,"lon":-81.2021,"freq":"114.1","region":"K"},"SDF":{"type":"VOR","name":"Louisville","lat":38.1744,"lon":-85.736,"freq":"113.0","region":"K"},"SJC":{"type":"VOR","name":"San Jose","lat":37.3626,"lon":-121.9291,"freq":"114.1","region":"K"},"SLC":{"type":"VOR","name":"Salt Lake City","lat":40.7861,"lon":-111.9773,"freq":"116.8","region":"K"},"STL":{"type":"VOR","name":"St Louis","lat":38.7487,"lon":-90.36,"freq":"117.4","region":"K"},"SYR":{"type":"VOR","name":"Syracuse","lat":43.1112,"lon":-76.1063,"freq":"117.0","region":"K"},"TEB":{"type":"VOR","name":"Teterboro","lat":40.85,"lon":-74.0608,"freq":"108.4","region":"K"},"TPA":{"type":"VOR","name":"Tampa","lat":27.9756,"lon":-82.5333,"freq":"115.4","region":"K"},"TUL":{"type":"VOR","name":"Tulsa","lat":36.1984,"lon":-95.8881,"freq":"114.4","region":"K"},"TTN":{"type":"VOR","name":"Trenton","lat":40.2767,"lon":-74.8133,"freq":"114.0","region":"K"},"SBJ":{"type":"VOR","name":"Solberg","lat":40.5767,"lon":-74.7367,"freq":"112.9","region":"K"},"LRP":{"type":"VOR","name":"Lancaster","lat":40.0983,"lon":-76.3017,"freq":"117.3","region":"K"},"ETG":{"type":"VOR","name":"Ellington","lat":29.6083,"lon":-95.1733,"freq":"111.8","region":"K"},"PSK":{"type":"VOR","name":"Pulaski","lat":37.0867,"lon":-80.6917,"freq":"116.8","region":"K"},"EMI":{"type":"VOR","name":"Westminster","lat":39.4917,"lon":-76.9783,"freq":"117.9","region":"K"},"OTT":{"type":"VOR","name":"Ottumwa","lat":41.105,"lon":-92.4483,"freq":"113.0","region":"K"},"DBQ":{"type":"VOR","name":"Dubuque","lat":42.4017,"lon":-90.7083,"freq":"114.0","region":"K"},"BAE":{"type":"VOR","name":"Milwaukee","lat":42.7633,"lon":-88.275,"freq":"116.4","region":"K"},"GIJ":{"type":"VOR","name":"Niles","lat":41.7667,"lon":-86.3167,"freq":"111.4","region":"K"},"FWA":{"type":"VOR","name":"Fort Wayne","lat":40.9783,"lon":-85.195,"freq":"113.0","region":"K"},"AIR":{"type":"VOR","name":"Bellaire","lat":40.03,"lon":-80.8233,"freq":"113.2","region":"K"},"JST":{"type":"VOR","name":"Johnstown","lat":40.3167,"lon":-78.8333,"freq":"111.6","region":"K"},"PSB":{"type":"VOR","name":"Phillipsburg","lat":40.8833,"lon":-77.85,"freq":"112.3","region":"K"},"HAR":{"type":"VOR","name":"Harrisburg","lat":40.2167,"lon":-76.8517,"freq":"112.1","region":"K"},"ETX":{"type":"VOR","name":"East Texas","lat":32.3833,"lon":-94.8167,"freq":"116.0","region":"K"},"MLC":{"type":"VOR","name":"McAlester","lat":34.8833,"lon":-95.7833,"freq":"117.5","region":"K"},"IRW":{"type":"VOR","name":"Wichita Falls","lat":33.9683,"lon":-98.49,"freq":"116.0","region":"K"},"ABI":{"type":"VOR","name":"Abilene","lat":32.4836,"lon":-99.8514,"freq":"113.7","region":"K"},"CDS":{"type":"VOR","name":"Childress","lat":34.4333,"lon":-100.2833,"freq":"117.6","region":"K"},"TCC":{"type":"VOR","name":"Tucumcari","lat":35.1828,"lon":-103.6031,"freq":"114.0","region":"K"},"ZUN":{"type":"VOR","name":"Zuni","lat":34.965,"lon":-109.1533,"freq":"113.2","region":"K"},"PGS":{"type":"VOR","name":"Peach Springs","lat":35.6167,"lon":-113.5667,"freq":"112.6","region":"K"},"BLD":{"type":"VOR","name":"Boulder City","lat":35.9467,"lon":-114.8617,"freq":"116.7","region":"K"},"DAG":{"type":"VOR","name":"Daggett","lat":34.9667,"lon":-116.6117,"freq":"113.2","region":"K"},"HEC":{"type":"VOR","name":"Hector","lat":34.7983,"lon":-116.46,"freq":"112.7","region":"K"},"PMD":{"type":"VOR","name":"Palmdale","lat":34.6294,"lon":-118.0847,"freq":"114.5","region":"K"},"VNY":{"type":"VOR","name":"Van Nuys","lat":34.2095,"lon":-118.4895,"freq":"113.1","region":"K"},"AVE":{"type":"VOR","name":"Avenal","lat":36.0117,"lon":-120.1533,"freq":"117.1","region":"K"},"EHF":{"type":"VOR","name":"Edwards","lat":34.9233,"lon":-117.895,"freq":"116.4","region":"K"},"FLW":{"type":"VOR","name":"Fellows","lat":35.1417,"lon":-119.8667,"freq":"117.9","region":"K"},"GVO":{"type":"VOR","name":"Gonzales","lat":36.51,"lon":-121.4367,"freq":"113.0","region":"K"},"MOD":{"type":"VOR","name":"Modesto","lat":37.6267,"lon":-120.9533,"freq":"114.6","region":"K"},"SAC":{"type":"VOR","name":"Sacramento","lat":38.5175,"lon":-121.4936,"freq":"115.2","region":"K"},"RBL":{"type":"VOR","name":"Red Bluff","lat":40.1517,"lon":-122.2367,"freq":"115.7","region":"K"},"OED":{"type":"VOR","name":"Medford","lat":42.4756,"lon":-122.9103,"freq":"113.6","region":"K"},"EUG":{"type":"VOR","name":"Eugene","lat":44.12,"lon":-123.2117,"freq":"112.9","region":"K"},"BTG":{"type":"VOR","name":"Battleground","lat":45.8133,"lon":-122.5767,"freq":"116.6","region":"K"},"OLM":{"type":"VOR","name":"Olympia","lat":46.9694,"lon":-122.9025,"freq":"113.4","region":"K"},"BNN":{"type":"VORDME","name":"Bovingdon","lat":51.7267,"lon":-0.55,"freq":"113.75","region":"EG"},"LYD":{"type":"VORDME","name":"Lydd","lat":50.9617,"lon":0.9183,"freq":"114.05","region":"EG"},"MID":{"type":"VORDME","name":"Midhurst","lat":51.05,"lon":-0.6217,"freq":"114.0","region":"EG"},"TNT":{"type":"VORDME","name":"Trent","lat":53.0533,"lon":-1.67,"freq":"115.7","region":"EG"},"WAL":{"type":"VORDME","name":"Wallasey","lat":53.39,"lon":-3.1283,"freq":"114.1","region":"EG"},"ADN":{"type":"VORDME","name":"Aberdeen","lat":57.3075,"lon":-2.2675,"freq":"114.3","region":"EG"},"INS":{"type":"VORDME","name":"Inverness","lat":57.5417,"lon":-4.0633,"freq":"109.2","region":"EG"},"WIK":{"type":"VORDME","name":"Wick","lat":58.4583,"lon":-3.0917,"freq":"113.6","region":"EG"},"BEL":{"type":"VORDME","name":"Belfast","lat":54.6583,"lon":-6.2233,"freq":"117.2","region":"EG"},"IOM":{"type":"VORDME","name":"Isle of Man","lat":54.0667,"lon":-4.7617,"freq":"112.2","region":"EG"},"STU":{"type":"VORDME","name":"Strumble","lat":51.9917,"lon":-5.035,"freq":"113.1","region":"EG"},"BCN":{"type":"VORDME","name":"Barcelona","lat":41.3042,"lon":2.1033,"freq":"116.5","region":"LE"},"EX":{"type":"VORDME","name":"Exeter","lat":50.7367,"lon":-3.4133,"freq":"114.15","region":"EG"},"BRS":{"type":"VORDME","name":"Bristol","lat":51.3833,"lon":-2.7133,"freq":"116.75","region":"EG"},"CDF":{"type":"VORDME","name":"Cardiff","lat":51.3933,"lon":-3.3417,"freq":"117.45","region":"EG"},"CLN":{"type":"VORDME","name":"Clacton","lat":51.8517,"lon":1.1517,"freq":"114.55","region":"EG"},"SFD":{"type":"VORDME","name":"Seaford","lat":50.7583,"lon":0.115,"freq":"117.0","region":"EG"},"BIG":{"type":"VORDME","name":"Biggin","lat":51.3308,"lon":0.0342,"freq":"115.1","region":"EG"},"SHA":{"type":"VORDME","name":"Shannon","lat":52.72,"lon":-8.925,"freq":"113.3","region":"EI"},"CRK":{"type":"VORDME","name":"Cork","lat":51.8414,"lon":-8.4911,"freq":"114.6","region":"EI"},"DUB":{"type":"VORDME","name":"Dublin","lat":53.4214,"lon":-6.27,"freq":"114.9","region":"EI"},"CON":{"type":"VORDME","name":"Connaught","lat":53.91,"lon":-8.8183,"freq":"115.0","region":"EI"},"ABB":{"type":"VORDME","name":"Abbeville","lat":50.1367,"lon":1.855,"freq":"108.45","region":"LF"},"AMB":{"type":"VORDME","name":"Amboise","lat":47.4283,"lon":0.9767,"freq":"114.3","region":"LF"},"BRY":{"type":"VORDME","name":"Bray","lat":48.515,"lon":3.3,"freq":"113.2","region":"LF"},"CGN":{"type":"VORDME","name":"Cognac","lat":45.6583,"lon":-0.3183,"freq":"114.4","region":"LF"},"CLM":{"type":"VORDME","name":"Coulommiers","lat":48.8383,"lon":3.0167,"freq":"117.6","region":"LF"},"CMB":{"type":"VORDME","name":"Cambrai","lat":50.2217,"lon":3.155,"freq":"112.6","region":"LF"},"CRL":{"type":"VORDME","name":"Charles de Gaulle","lat":49.0117,"lon":2.55,"freq":"117.95","region":"LF"},"DIJ":{"type":"VORDME","name":"Dijon","lat":47.27,"lon":5.0917,"freq":"115.0","region":"LF"},"EPR":{"type":"VORDME","name":"Eperney","lat":49.0583,"lon":3.81,"freq":"112.3","region":"LF"},"LGL":{"type":"VORDME","name":"Le Luc","lat":43.3833,"lon":6.3917,"freq":"114.5","region":"LF"},"LMG":{"type":"VORDME","name":"Limoges","lat":45.8617,"lon":1.175,"freq":"114.5","region":"LF"},"LSE":{"type":"VORDME","name":"Lyon Saint-Exupery","lat":45.7217,"lon":5.0833,"freq":"115.45","region":"LF"},"MEN":{"type":"VORDME","name":"Mende","lat":44.5017,"lon":3.5317,"freq":"112.2","region":"LF"},"MTL":{"type":"VORDME","name":"Montpellier","lat":43.5767,"lon":3.9617,"freq":"113.45","region":"LF"},"NTS":{"type":"VORDME","name":"Nantes","lat":47.1567,"lon":-1.6033,"freq":"113.2","region":"LF"},"OPR":{"type":"VORDME","name":"Paris Orly","lat":48.7233,"lon":2.3183,"freq":"111.1","region":"LF"},"REN":{"type":"VORDME","name":"Rennes","lat":48.0683,"lon":-1.7333,"freq":"116.1","region":"LF"},"TOU":{"type":"VORDME","name":"Toulouse","lat":43.6817,"lon":1.32,"freq":"117.7","region":"LF"},"MRS":{"type":"VORDME","name":"Marseille","lat":43.4367,"lon":5.215,"freq":"112.2","region":"LF"},"NIZ":{"type":"VORDME","name":"Nice","lat":43.6583,"lon":7.22,"freq":"112.4","region":"LF"},"BGN":{"type":"VORDME","name":"Bourges","lat":47.0533,"lon":2.3617,"freq":"116.1","region":"LF"},"POI":{"type":"VORDME","name":"Poitiers","lat":46.585,"lon":0.305,"freq":"113.6","region":"LF"},"BDX":{"type":"VORDME","name":"Bordeaux","lat":44.8267,"lon":-0.715,"freq":"114.3","region":"LF"},"STR":{"type":"VORDME","name":"Strasbourg","lat":48.5383,"lon":7.6283,"freq":"115.1","region":"LF"},"FFM":{"type":"VORDME","name":"Frankfurt","lat":50.0533,"lon":8.6383,"freq":"114.2","region":"ED"},"RUG":{"type":"VORDME","name":"Ruegen","lat":54.3833,"lon":13.3233,"freq":"116.4","region":"ED"},"FBG":{"type":"VORDME","name":"Freiburg","lat":48.2117,"lon":7.9017,"freq":"110.2","region":"ED"},"DKB":{"type":"VORDME","name":"Dinkelsbuehl","lat":49.0683,"lon":10.225,"freq":"117.6","region":"ED"},"FUL":{"type":"VORDME","name":"Fulda","lat":50.5983,"lon":9.575,"freq":"114.7","region":"ED"},"KRH":{"type":"VORDME","name":"Karlsruhe","lat":49.115,"lon":8.5883,"freq":"115.8","region":"ED"},"RDG":{"type":"VORDME","name":"Ried","lat":48.0533,"lon":11.1267,"freq":"116.6","region":"ED"},"SPY":{"type":"VORDME","name":"Spangdahlem","lat":49.9717,"lon":6.6917,"freq":"112.5","region":"ED"},"TAU":{"type":"VORDME","name":"Taunus","lat":50.2117,"lon":8.5167,"freq":"116.0","region":"ED"},"NVO":{"type":"VORDME","name":"Norderney","lat":53.7067,"lon":7.2283,"freq":"113.8","region":"ED"},"GTQ":{"type":"VORDME","name":"Guetersloh","lat":51.9233,"lon":8.3117,"freq":"109.05","region":"ED"},"WRB":{"type":"VORDME","name":"Warburg","lat":51.4867,"lon":9.4617,"freq":"113.6","region":"ED"},"HAM":{"type":"VORDME","name":"Hamburg","lat":53.6844,"lon":10.2006,"freq":"113.1","region":"ED"},"HDO":{"type":"VORDME","name":"Hehlingen","lat":52.3283,"lon":10.565,"freq":"112.0","region":"ED"},"BER":{"type":"VORDME","name":"Berlin","lat":52.4533,"lon":13.1633,"freq":"112.3","region":"ED"},"OPK":{"type":"VORDME","name":"Opitz","lat":52.3167,"lon":13.4833,"freq":"115.7","region":"ED"},"KLF":{"type":"VORDME","name":"Koelln","lat":50.865,"lon":7.1833,"freq":"116.3","region":"ED"},"DUS":{"type":"VORDME","name":"Dusseldorf","lat":51.2617,"lon":6.7583,"freq":"114.8","region":"ED"},"SPL":{"type":"VORDME","name":"Spijkerboor","lat":52.5317,"lon":4.85,"freq":"112.6","region":"EH"},"PAM":{"type":"VORDME","name":"Pampus","lat":52.37,"lon":5.2033,"freq":"114.05","region":"EH"},"EEL":{"type":"VORDME","name":"Eelde","lat":53.1283,"lon":6.5783,"freq":"113.2","region":"EH"},"CIV":{"type":"VORDME","name":"Chievres","lat":50.58,"lon":3.81,"freq":"113.2","region":"EB"},"LNO":{"type":"VORDME","name":"Liege","lat":50.6517,"lon":5.3817,"freq":"112.6","region":"EB"},"DIK":{"type":"VORDME","name":"Diekirch","lat":49.8683,"lon":6.1317,"freq":"112.1","region":"EL"},"VIT":{"type":"VORDME","name":"Vitoria","lat":42.8783,"lon":-2.7283,"freq":"116.8","region":"LE"},"BLV":{"type":"VORDME","name":"Bilbao","lat":43.3017,"lon":-2.9067,"freq":"115.8","region":"LE"},"SVL":{"type":"VORDME","name":"Seville","lat":37.4178,"lon":-5.8931,"freq":"116.5","region":"LE"},"ROM":{"type":"VORDME","name":"Rome","lat":41.8003,"lon":12.2389,"freq":"112.8","region":"LI"},"TAQ":{"type":"VORDME","name":"Taormina","lat":37.9167,"lon":15.0667,"freq":"116.6","region":"LI"},"TOP":{"type":"VORDME","name":"Treviso","lat":45.6483,"lon":12.18,"freq":"110.0","region":"LI"},"BOA":{"type":"VORDME","name":"Bologna","lat":44.53,"lon":11.2917,"freq":"112.1","region":"LI"},"FLR":{"type":"VORDME","name":"Florence","lat":43.81,"lon":11.2017,"freq":"116.4","region":"LI"},"GEN":{"type":"VORDME","name":"Genova","lat":44.4267,"lon":8.8367,"freq":"117.1","region":"LI"},"PAD":{"type":"VORDME","name":"Padova","lat":45.3717,"lon":11.8483,"freq":"112.3","region":"LI"},"VEN":{"type":"VORDME","name":"Venezia","lat":45.4283,"lon":12.33,"freq":"112.4","region":"LI"},"NAP":{"type":"VORDME","name":"Napoli","lat":40.8833,"lon":14.2917,"freq":"113.9","region":"LI"},"OSL":{"type":"VORDME","name":"Oslo","lat":60.1939,"lon":11.1003,"freq":"113.2","region":"EN"},"ARS":{"type":"VORDME","name":"Arlanda","lat":59.655,"lon":17.9367,"freq":"115.6","region":"ES"},"KAS":{"type":"VORDME","name":"Kastrup","lat":55.6069,"lon":12.6722,"freq":"112.5","region":"EK"},"HEL":{"type":"VORDME","name":"Helsinki","lat":60.3172,"lon":24.9633,"freq":"116.9","region":"EF"},"ZUE":{"type":"VORDME","name":"Zurich East","lat":47.5917,"lon":8.8183,"freq":"110.05","region":"LS"},"KLO":{"type":"VORDME","name":"Kloten","lat":47.4583,"lon":8.5517,"freq":"115.85","region":"LS"},"TRA":{"type":"VORDME","name":"Trasadingen","lat":47.6883,"lon":8.4317,"freq":"114.3","region":"LS"},"WIL":{"type":"VORDME","name":"Willisau","lat":47.1717,"lon":7.8567,"freq":"116.6","region":"LS"},"SBG":{"type":"VORDME","name":"Salzburg","lat":47.7833,"lon":13.0033,"freq":"114.1","region":"LO"},"INN":{"type":"VORDME","name":"Innsbruck","lat":47.2533,"lon":11.4617,"freq":"111.2","region":"LO"},"WAR":{"type":"VORDME","name":"Warsaw","lat":52.165,"lon":20.9667,"freq":"113.0","region":"EP"},"BUC":{"type":"VORDME","name":"Bucharest","lat":44.57,"lon":26.0833,"freq":"116.5","region":"LR"},"RYD":{"type":"VORDME","name":"Riyadh","lat":24.7112,"lon":46.6906,"freq":"114.0","region":"OE"},"TLV":{"type":"VORDME","name":"Tel Aviv","lat":32.0094,"lon":34.8822,"freq":"112.7","region":"LL"},"BEY":{"type":"VORDME","name":"Beirut","lat":33.8206,"lon":35.4886,"freq":"112.6","region":"OL"},"AMM":{"type":"VORDME","name":"Amman","lat":31.7225,"lon":35.9931,"freq":"112.2","region":"OJ"},"BGW":{"type":"VORDME","name":"Baghdad","lat":33.2625,"lon":44.2344,"freq":"116.4","region":"OR"},"MAA":{"type":"VORDME","name":"Chennai","lat":12.9941,"lon":80.1707,"freq":"116.6","region":"VO"},"CCU":{"type":"VORDME","name":"Kolkata","lat":22.6547,"lon":88.4467,"freq":"113.3","region":"VE"},"BLR":{"type":"VORDME","name":"Bangalore","lat":13.1979,"lon":77.7063,"freq":"117.35","region":"VO"},"TPE":{"type":"VORDME","name":"Taipei","lat":25.0797,"lon":121.2342,"freq":"112.3","region":"RC"},"CGK":{"type":"VORDME","name":"Jakarta","lat":-6.1256,"lon":106.6558,"freq":"112.3","region":"WI"},"YOW":{"type":"VORDME","name":"Ottawa","lat":45.3225,"lon":-75.6692,"freq":"114.2","region":"CY"},"YQB":{"type":"VORDME","name":"Quebec","lat":46.7911,"lon":-71.3933,"freq":"112.8","region":"CY"},"YQX":{"type":"VORDME","name":"Gander","lat":48.9369,"lon":-54.5681,"freq":"112.7","region":"CY"},"YYT":{"type":"VORDME","name":"St Johns","lat":47.6186,"lon":-52.7519,"freq":"113.0","region":"CY"},"YMX":{"type":"VORDME","name":"Mirabel","lat":45.6667,"lon":-74.0333,"freq":"112.5","region":"CY"},"YQM":{"type":"VORDME","name":"Moncton","lat":46.1122,"lon":-64.6786,"freq":"115.5","region":"CY"},"GIG":{"type":"VORDME","name":"Rio de Janeiro","lat":-22.8099,"lon":-43.2505,"freq":"115.5","region":"SB"},"PTY":{"type":"VORDME","name":"Panama City","lat":9.0714,"lon":-79.3835,"freq":"113.0","region":"MP"},"CCS":{"type":"VORDME","name":"Caracas","lat":10.6012,"lon":-66.9912,"freq":"116.5","region":"SV"}},"fixes":{"NATU":{"lat":51.5,"lon":-15.0,"region":"EG"},"NEBIN":{"lat":51.45,"lon":-14.5,"region":"EG"},"LIMRI":{"lat":51.2,"lon":-10.0,"region":"EG"},"XAMAN":{"lat":51.0,"lon":-8.5,"region":"EG"},"PIKIL":{"lat":50.5,"lon":-5.0,"region":"EG"},"ELSIR":{"lat":50.0,"lon":-2.0,"region":"EG"},"GOMUP":{"lat":49.5,"lon":0.5,"region":"EG"},"ETIKI":{"lat":49.0,"lon":3.0,"region":"LF"},"DOGAL":{"lat":48.0,"lon":5.0,"region":"LF"},"BABAN":{"lat":47.0,"lon":7.0,"region":"LS"},"LOACH":{"lat":46.5,"lon":8.0,"region":"LS"},"GIPER":{"lat":45.5,"lon":10.0,"region":"LI"},"RESNO":{"lat":44.5,"lon":12.0,"region":"LI"},"VIXUN":{"lat":43.5,"lon":14.0,"region":"LI"},"MUSAK":{"lat":42.5,"lon":15.0,"region":"LI"},"MALOT":{"lat":41.5,"lon":17.0,"region":"LG"},"ALLRY":{"lat":40.5,"lon":19.0,"region":"LG"},"SEPAL":{"lat":39.5,"lon":21.0,"region":"LG"},"BERTH":{"lat":38.5,"lon":23.0,"region":"LG"},"SLATN":{"lat":37.5,"lon":25.0,"region":"LT"},"COLOR":{"lat":36.5,"lon":27.0,"region":"LT"},"DEVAL":{"lat":35.5,"lon":29.0,"region":"LT"},"TUSKY":{"lat":34.5,"lon":31.0,"region":"HE"},"CYMON":{"lat":33.5,"lon":33.0,"region":"HE"},"HOIST":{"lat":32.5,"lon":35.0,"region":"OE"},"STEAM":{"lat":31.5,"lon":37.0,"region":"OE"},"MERIT":{"lat":51.8669,"lon":-0.4208,"region":"EG"},"TALLA":{"lat":51.9083,"lon":-1.0,"region":"EG"},"BUZAD":{"lat":52.0,"lon":-1.5,"region":"EG"},"DESAP":{"lat":52.1,"lon":-2.0,"region":"EG"},"ADNID":{"lat":52.2,"lon":-2.5,"region":"EG"},"ROKIL":{"lat":52.3,"lon":-3.0,"region":"EG"},"GOXUL":{"lat":52.4,"lon":-3.5,"region":"EG"},"MODMI":{"lat":52.5,"lon":-4.0,"region":"EG"},"NUGRA":{"lat":52.6,"lon":-4.5,"region":"EG"},"TOPPA":{"lat":52.7,"lon":-5.0,"region":"EG"},"KIDLI":{"lat":52.8,"lon":-5.5,"region":"EG"},"RIBEL":{"lat":52.9,"lon":-6.0,"region":"EG"},"SOXER":{"lat":53.0,"lon":-6.5,"region":"EG"},"KONOL":{"lat":53.1,"lon":-7.0,"region":"EG"},"ZAGRO":{"lat":53.2,"lon":-7.5,"region":"EG"},"AMLEV":{"lat":53.3,"lon":-8.0,"region":"EG"},"DIWUN":{"lat":53.4,"lon":-8.5,"region":"EG"},"XIDIL":{"lat":53.5,"lon":-9.0,"region":"EG"},"BAKUR":{"lat":53.6,"lon":-9.5,"region":"EG"},"BASNO":{"lat":53.7,"lon":-10.0,"region":"EG"},"CUNOP":{"lat":53.8,"lon":-10.5,"region":"EG"},"DINIM":{"lat":53.9,"lon":-11.0,"region":"EG"},"ELMUR":{"lat":54.0,"lon":-11.5,"region":"EG"},"FOSVA":{"lat":54.1,"lon":-12.0,"region":"EG"},"GADSI":{"lat":54.2,"lon":-12.5,"region":"EG"},"HOKIL":{"lat":54.3,"lon":-13.0,"region":"EG"},"INKUR":{"lat":54.4,"lon":-13.5,"region":"EG"},"JOLNO":{"lat":54.5,"lon":-14.0,"region":"EG"},"KILMU":{"lat":54.6,"lon":-14.5,"region":"EG"},"LUNOP":{"lat":54.7,"lon":-15.0,"region":"EG"},"MONAB":{"lat":54.8,"lon":-15.5,"region":"EG"},"NIPRU":{"lat":54.9,"lon":-16.0,"region":"EG"},"OGDIT":{"lat":55.0,"lon":-16.5,"region":"EG"},"PUDEL":{"lat":55.1,"lon":-17.0,"region":"EG"},"RIDMU":{"lat":55.2,"lon":-17.5,"region":"EG"},"SAPNO":{"lat":55.3,"lon":-18.0,"region":"EG"},"TIDUR":{"lat":55.4,"lon":-18.5,"region":"EG"},"UVROP":{"lat":55.5,"lon":-19.0,"region":"EG"},"VIDEL":{"lat":55.6,"lon":-19.5,"region":"EG"},"WOXIN":{"lat":55.7,"lon":-20.0,"region":"EG"},"XIMBO":{"lat":55.8,"lon":-20.5,"region":"EG"},"YUGOR":{"lat":55.9,"lon":-21.0,"region":"EG"},"ZIBEL":{"lat":56.0,"lon":-21.5,"region":"EG"},"KONAN":{"lat":51.55,"lon":0.5,"region":"EG"},"ORTAC":{"lat":50.15,"lon":-2.5,"region":"EG"},"KATHY":{"lat":49.8,"lon":-2.0,"region":"EG"},"SITET":{"lat":49.5,"lon":-1.5,"region":"EG"},"NATEB":{"lat":49.2,"lon":-1.0,"region":"LF"},"SAPCO":{"lat":48.9,"lon":-0.5,"region":"LF"},"ASKEY":{"lat":48.6,"lon":0.0,"region":"LF"},"RODNI":{"lat":48.3,"lon":0.5,"region":"LF"},"LOGAN":{"lat":48.0,"lon":1.0,"region":"LF"},"LEDBO":{"lat":47.7,"lon":1.5,"region":"LF"},"GISNO":{"lat":47.4,"lon":2.0,"region":"LF"},"SOSIM":{"lat":47.1,"lon":2.5,"region":"LF"},"MAKUX":{"lat":46.8,"lon":3.0,"region":"LS"},"PELIG":{"lat":46.5,"lon":3.5,"region":"LS"},"DENUT":{"lat":46.2,"lon":4.0,"region":"LS"},"CAMRN":{"lat":40.5,"lon":-74.0,"region":"K"},"BETTE":{"lat":40.3,"lon":-73.5,"region":"K"},"RANCE":{"lat":40.1,"lon":-73.0,"region":"K"},"GRAYM":{"lat":39.9,"lon":-72.5,"region":"K"},"HAFNR":{"lat":39.7,"lon":-72.0,"region":"K"},"WAVEY":{"lat":39.5,"lon":-71.5,"region":"K"},"DOTTY":{"lat":39.3,"lon":-71.0,"region":"K"},"CLVIN":{"lat":39.1,"lon":-70.5,"region":"K"},"NEWEL":{"lat":38.9,"lon":-70.0,"region":"K"},"ROBUC":{"lat":38.7,"lon":-69.5,"region":"K"},"SOPIN":{"lat":35.5,"lon":-97.5,"region":"K"},"TULSA":{"lat":36.2,"lon":-95.9,"region":"K"},"PONCA":{"lat":36.7,"lon":-94.3,"region":"K"},"MEMPH":{"lat":35.1,"lon":-90.0,"region":"K"},"LOUIS":{"lat":38.75,"lon":-90.37,"region":"K"},"GIBBZ":{"lat":40.5,"lon":-88.0,"region":"K"},"SKIPO":{"lat":41.5,"lon":-87.0,"region":"K"},"MIDIM":{"lat":43.0,"lon":-85.0,"region":"K"},"COLEM":{"lat":44.0,"lon":-83.0,"region":"K"},"CLARD":{"lat":45.0,"lon":-81.0,"region":"K"},"DAVOW":{"lat":46.0,"lon":-79.0,"region":"K"},"ESSEX":{"lat":43.3,"lon":-82.5,"region":"K"},"AMMON":{"lat":43.1,"lon":-111.5,"region":"K"},"HAZEL":{"lat":39.0,"lon":-111.5,"region":"K"},"PROVO":{"lat":40.2,"lon":-111.6,"region":"K"},"MONTI":{"lat":41.9,"lon":-111.8,"region":"K"},"ALTAM":{"lat":42.5,"lon":-111.0,"region":"K"},"BELLE":{"lat":44.5,"lon":-108.0,"region":"K"},"GREND":{"lat":43.5,"lon":-106.0,"region":"K"},"MOREY":{"lat":43.0,"lon":-104.0,"region":"K"},"LAMAR":{"lat":38.1,"lon":-102.5,"region":"K"},"PHENS":{"lat":33.5,"lon":-112.0,"region":"K"},"GILSE":{"lat":33.4,"lon":-111.3,"region":"K"},"LUCIN":{"lat":41.8,"lon":-113.7,"region":"K"},"PINTA":{"lat":40.3,"lon":-114.3,"region":"K"},"GALLO":{"lat":39.5,"lon":-117.0,"region":"K"},"MELOW":{"lat":37.8,"lon":-119.0,"region":"K"},"TAHOE":{"lat":38.9,"lon":-120.0,"region":"K"},"NEXUS":{"lat":37.5,"lon":-121.5,"region":"K"},"SUNOL":{"lat":37.6,"lon":-121.8,"region":"K"},"CESTA":{"lat":36.8,"lon":-122.3,"region":"K"},"SABLE":{"lat":36.0,"lon":-121.0,"region":"K"},"ACTON":{"lat":34.5,"lon":-118.2,"region":"K"},"DALEA":{"lat":33.9,"lon":-117.3,"region":"K"},"GORDO":{"lat":33.3,"lon":-116.4,"region":"K"},"PALMS":{"lat":34.7,"lon":-116.5,"region":"K"},"RMNTS":{"lat":34.0,"lon":-115.6,"region":"K"},"SHADY":{"lat":37.5,"lon":-116.0,"region":"K"},"MORNT":{"lat":35.8,"lon":-115.0,"region":"K"},"BORON":{"lat":34.5,"lon":-117.9,"region":"K"},"VISTA":{"lat":33.2,"lon":-117.2,"region":"K"},"BAYST":{"lat":32.7,"lon":-116.5,"region":"K"},"CAJON":{"lat":34.0,"lon":-117.4,"region":"K"},"DEXTR":{"lat":34.6,"lon":-117.8,"region":"K"},"MINAS":{"lat":34.8,"lon":-118.1,"region":"K"},"OCEAN":{"lat":34.5,"lon":-119.5,"region":"K"},"PEDGE":{"lat":33.9,"lon":-118.3,"region":"K"},"RUSTY":{"lat":33.0,"lon":-117.0,"region":"K"},"SANDI":{"lat":32.7,"lon":-117.2,"region":"K"},"TRANG":{"lat":32.5,"lon":-117.0,"region":"K"},"UPLAND":{"lat":34.1,"lon":-117.6,"region":"K"},"RATSU":{"lat":51.5,"lon":-15.0,"type":"FIX"},"SUNOT":{"lat":54.5,"lon":-15.0,"type":"FIX"},"MIMKU":{"lat":49.0,"lon":-50.0,"type":"FIX"},"SAVRY":{"lat":48.0,"lon":-50.0,"type":"FIX"},"JANJO":{"lat":47.0,"lon":-50.0,"type":"FIX"},"PELTU":{"lat":50.0,"lon":-50.0,"type":"FIX"},"NOMAN":{"lat":44.5,"lon":-67.0,"type":"FIX"},"PRAWN":{"lat":44.0,"lon":-65.0,"type":"FIX"},"MANDY":{"lat":50.65,"lon":-1.1333,"type":"FIX"},"KENET":{"lat":50.8333,"lon":-0.5667,"type":"FIX"},"BOGNA":{"lat":50.7333,"lon":-0.75,"type":"FIX"},"HARDY":{"lat":50.3333,"lon":-1.6667,"type":"FIX"},"PEPIS":{"lat":50.1833,"lon":-2.5833,"type":"FIX"},"SLANY":{"lat":51.8,"lon":-8.1667,"type":"FIX"},"MOGLI":{"lat":50.6667,"lon":-6.8333,"type":"FIX"},"SOVED":{"lat":51.3333,"lon":-5.0,"type":"FIX"},"BANBA":{"lat":51.0,"lon":-8.0,"type":"FIX"},"NUMPO":{"lat":51.4167,"lon":-0.0833,"type":"FIX"},"GASGU":{"lat":51.45,"lon":-0.6667,"type":"FIX"},"WOBUN":{"lat":52.0,"lon":-0.55,"type":"FIX"},"SILVA":{"lat":51.5833,"lon":-2.1333,"type":"FIX"},"BEDEK":{"lat":51.1667,"lon":-0.1667,"type":"FIX"},"TIMBA":{"lat":51.3167,"lon":-0.55,"type":"FIX"},"DAGGA":{"lat":51.1833,"lon":-2.0667,"type":"FIX"},"NEVIL":{"lat":50.9167,"lon":-2.0667,"type":"FIX"},"EXMOR":{"lat":51.2,"lon":-3.5333,"type":"FIX"},"BIBAX":{"lat":49.5167,"lon":0.1667,"type":"FIX"},"ABBOT":{"lat":52.3333,"lon":0.5667,"type":"FIX"},"REDFA":{"lat":51.9333,"lon":2.0833,"type":"FIX"},"BRAIN":{"lat":52.5667,"lon":1.7333,"type":"FIX"},"LOREL":{"lat":52.5,"lon":2.0,"type":"FIX"},"GAVIN":{"lat":53.5333,"lon":-1.5333,"type":"FIX"},"OTBED":{"lat":53.5,"lon":-0.2667,"type":"FIX"},"ITSUX":{"lat":55.1333,"lon":-3.0,"type":"FIX"},"LAKEY":{"lat":55.3,"lon":-4.0,"type":"FIX"},"ARTOV":{"lat":49.5,"lon":2.3333,"type":"FIX"},"DIKRO":{"lat":49.3667,"lon":2.6333,"type":"FIX"},"MOPAR":{"lat":49.1667,"lon":3.3333,"type":"FIX"},"REMBA":{"lat":49.0,"lon":3.6667,"type":"FIX"},"LERGA":{"lat":48.3333,"lon":3.9167,"type":"FIX"},"BERGI":{"lat":48.8333,"lon":4.3333,"type":"FIX"},"TELSI":{"lat":48.5,"lon":5.3333,"type":"FIX"},"PITES":{"lat":49.0833,"lon":3.1667,"type":"FIX"},"ABNUR":{"lat":47.6667,"lon":6.5,"type":"FIX"},"LFMN":{"lat":43.6583,"lon":7.215,"type":"FIX"},"LISBO":{"lat":38.7756,"lon":-9.135,"type":"FIX"},"EKERN":{"lat":50.8333,"lon":3.5,"type":"FIX"},"HELEN":{"lat":51.25,"lon":4.6667,"type":"FIX"},"BASOP":{"lat":51.8333,"lon":5.4,"type":"FIX"},"RIXEN":{"lat":51.0,"lon":6.5667,"type":"FIX"},"DODEN":{"lat":51.3333,"lon":7.0,"type":"FIX"},"AMASI":{"lat":50.2667,"lon":7.6667,"type":"FIX"},"ANORA":{"lat":49.5,"lon":8.8333,"type":"FIX"},"LARED":{"lat":48.3333,"lon":9.5,"type":"FIX"},"GERSA":{"lat":48.1667,"lon":10.3333,"type":"FIX"},"ERNAS":{"lat":47.6667,"lon":10.1667,"type":"FIX"},"BEGEN":{"lat":47.5,"lon":8.3333,"type":"FIX"},"VEBIT":{"lat":47.1667,"lon":7.3333,"type":"FIX"},"MILPA":{"lat":46.0,"lon":7.0,"type":"FIX"},"SORAL":{"lat":46.1833,"lon":6.0167,"type":"FIX"},"KINES":{"lat":45.6667,"lon":5.6667,"type":"FIX"},"MOKDI":{"lat":44.8333,"lon":5.1667,"type":"FIX"},"OLRAK":{"lat":44.25,"lon":4.75,"type":"FIX"},"OKRIX":{"lat":43.75,"lon":4.5,"type":"FIX"},"NARAK":{"lat":43.5,"lon":7.0,"type":"FIX"},"LANNA":{"lat":41.9167,"lon":-72.6167,"type":"FIX"},"RAALF":{"lat":41.3833,"lon":-73.85,"type":"FIX"},"COATE":{"lat":41.1333,"lon":-74.3167,"type":"FIX"},"HAAYS":{"lat":40.7,"lon":-74.5333,"type":"FIX"},"ELIOT":{"lat":40.3333,"lon":-75.3333,"type":"FIX"},"BOJID":{"lat":39.6833,"lon":-75.3333,"type":"FIX"},"TERRI":{"lat":39.0,"lon":-76.3333,"type":"FIX"},"MAGIO":{"lat":38.2,"lon":-77.3333,"type":"FIX"},"GRACO":{"lat":37.5,"lon":-77.8333,"type":"FIX"},"COLIN":{"lat":36.8333,"lon":-78.1667,"type":"FIX"},"FILPS":{"lat":36.0,"lon":-79.0,"type":"FIX"},"LURAY":{"lat":38.6667,"lon":-78.4667,"type":"FIX"},"JERES":{"lat":38.0,"lon":-79.0,"type":"FIX"},"HIDEN":{"lat":37.0833,"lon":-76.3333,"type":"FIX"},"PARCH":{"lat":34.2833,"lon":-78.3333,"type":"FIX"},"SCOOB":{"lat":33.6667,"lon":-79.2833,"type":"FIX"},"LAMPN":{"lat":32.5,"lon":-80.8333,"type":"FIX"},"HEKMN":{"lat":42.5667,"lon":-71.1667,"type":"FIX"},"BOSOX":{"lat":42.1833,"lon":-70.75,"type":"FIX"},"WHITE":{"lat":40.3,"lon":-73.9,"type":"FIX"},"SAAME":{"lat":39.15,"lon":-77.0,"type":"FIX"},"PALEO":{"lat":40.15,"lon":-74.7,"type":"FIX"},"PANZE":{"lat":40.5,"lon":-74.3,"type":"FIX"},"SHAFF":{"lat":40.0833,"lon":-76.3333,"type":"FIX"},"BUNTS":{"lat":39.35,"lon":-76.55,"type":"FIX"},"EMIRO":{"lat":25.3333,"lon":56.3333,"type":"FIX"},"ANVIX":{"lat":26.0,"lon":55.6667,"type":"FIX"},"DAVMO":{"lat":24.5,"lon":54.5,"type":"FIX"},"LOVOL":{"lat":25.5,"lon":57.5,"type":"FIX"},"IMPED":{"lat":26.5,"lon":56.0,"type":"FIX"},"NODVI":{"lat":24.0,"lon":53.6667,"type":"FIX"},"ALSAS":{"lat":25.0,"lon":52.5,"type":"FIX"},"TUMAK":{"lat":24.6667,"lon":51.0,"type":"FIX"},"DESDI":{"lat":23.3333,"lon":57.8333,"type":"FIX"},"ELATO":{"lat":35.8333,"lon":139.6667,"type":"FIX"},"ADDUM":{"lat":35.5333,"lon":140.1667,"type":"FIX"},"TEDIX":{"lat":34.0,"lon":136.0,"type":"FIX"},"VIBRA":{"lat":22.5,"lon":113.5,"type":"FIX"},"ATIMA":{"lat":22.8333,"lon":114.5,"type":"FIX"},"CANTO":{"lat":23.1667,"lon":113.3333,"type":"FIX"}},"airways":{"NAT-A":{"type":"high","fixes":[]},"NAT-B":{"type":"high","fixes":[]},"NAT-C":{"type":"high","fixes":[]},"NAT-D":{"type":"high","fixes":[]},"NAT-E":{"type":"high","fixes":[]},"NAT-F":{"type":"high","fixes":[]},"NAT-G":{"type":"high","fixes":[]},"NAT-H":{"type":"high","fixes":[]},"NAT-I":{"type":"high","fixes":[]},"NAT-J":{"type":"high","fixes":[]},"NAT-K":{"type":"high","fixes":[]},"NAT-L":{"type":"high","fixes":[]},"NAT-M":{"type":"high","fixes":[]},"NAT-N":{"type":"high","fixes":[]},"NAT-O":{"type":"high","fixes":[]},"NAT-P":{"type":"high","fixes":[]},"NAT-Q":{"type":"high","fixes":[]},"NAT-R":{"type":"high","fixes":[]},"NAT-S":{"type":"high","fixes":[]},"NAT-T":{"type":"high","fixes":[]},"NAT-U":{"type":"high","fixes":[]},"NAT-V":{"type":"high","fixes":[]},"NAT-W":{"type":"high","fixes":[]},"NAT-X":{"type":"high","fixes":[]},"NAT-Y":{"type":"high","fixes":[]},"NAT-Z":{"type":"high","fixes":[]},"UL612":{"type":"high","fixes":["GOW","TALLA","MERIT","BUZAD","DESAP"]},"UL9":{"type":"high","fixes":["DVR","ASKEY","NATEB"]},"UL607":{"type":"high","fixes":["LON","KONAN","LOGASN"]},"UN601":{"type":"high","fixes":["BPK","RODNI","LEDBO"]},"UP6":{"type":"high","fixes":["SAM","GISNO","SOSIM"]},"UN610":{"type":"high","fixes":["LAM","DET","MAKUX"]},"UT420":{"type":"both","fixes":["HON","BUB","PELIG"]},"UY53":{"type":"low","fixes":["BHD","STN","DENUT"]},"UB4":{"type":"low","fixes":["DVR","NIK","NTM"]},"UL610":{"type":"high","fixes":["OCK","SPI","ORTAC"]},"UM185":{"type":"high","fixes":["FRA","MUN","ZUR"]},"UM604":{"type":"high","fixes":["AMS","BRU","CDG"]},"UP2":{"type":"high","fixes":["MAD","FCO","ATH"]},"UQ4":{"type":"both","fixes":["LIS","CMN","CAI"]},"UR1":{"type":"high","fixes":["IST","DXB","MCT"]},"UT10":{"type":"both","fixes":["RUH","JED","BAH"]},"J6":{"type":"low","fixes":["JFK","CAMRN","BETTE"]},"J75":{"type":"low","fixes":["LAX","MELOW","TAHOE"]},"J80":{"type":"low","fixes":["ORD","GIBBZ","SKIPO"]},"J121":{"type":"low","fixes":["ATL","MEMPH","LOUIS"]},"J146":{"type":"low","fixes":["DFW","TULSA","SOPIN"]},"J148":{"type":"low","fixes":["BOS","EWR","ESSEX"]},"J150":{"type":"low","fixes":["SFO","ACTON","DALEA"]},"J174":{"type":"low","fixes":["MIA","DOTTY","CLVIN"]},"J190":{"type":"low","fixes":["SEA","LUCIN","PINTA"]},"Q113":{"type":"low","fixes":["DEN","LAMAR","MOREY"]},"Q64":{"type":"low","fixes":["PHX","GALLO","RMNTS"]},"Q75":{"type":"low","fixes":["LAS","SHADY","MORNT"]},"A1":{"type":"both","fixes":["NRT","HND","HKG"]},"A17":{"type":"both","fixes":["PEK","PVG","SIN"]},"A202":{"type":"both","fixes":["BKK","ICN","KUL"]},"A338":{"type":"both","fixes":["MNL","DEL","BOM"]},"A457":{"type":"both","fixes":["SYD","MEL","AKL"]},"A576":{"type":"both","fixes":["BNE","PER","GRU"]},"B339":{"type":"both","fixes":["EZE","BOG","SCL"]},"G215":{"type":"both","fixes":["LIM","JNB","CPT"]},"L507":{"type":"low","fixes":["NBO","CAI","CMN"]},"L888":{"type":"low","fixes":["ADD","LOS","MIA"]},"M771":{"type":"both","fixes":["YVR","YYC","YEG"]},"N644":{"type":"both","fixes":["YWG","YYZ","YUL"]},"P574":{"type":"both","fixes":["YHZ","MEX","CUN"]},"R216":{"type":"both","fixes":["LAP","DAVOW","CLARD"]},"T112":{"type":"both","fixes":["DAL","HOU","DCA"]},"V1":{"type":"low","fixes":["CLT","PHL","DTW"]},"L9":{"fixes":["DVR","KONAN","NATEB"]},"L620":{"fixes":["BOGNA","KENET","SFD","DVR"]},"M604":{"fixes":["DUB","SLANY","BABAN"]},"N862":{"fixes":["BPK","CLN","REDFA","BRAIN"]},"N859":{"fixes":["HON","GAVIN","OTBED"]},"Q63":{"fixes":["SILVA","BRS","EXMOR"]},"T420":{"fixes":["TALLA","LAKEY","GOW"]},"Y96":{"fixes":["NUMPO","BIG","TIMBA","OCK"]},"L10":{"fixes":["HARDY","PEPIS","ORTAC"]},"L15":{"fixes":["SAM","KENET","DVR"]},"M17":{"fixes":["BAKUR","BIBAX","ABB"]},"N601":{"fixes":["REDFA","BRAIN","LOREL"]},"P2":{"fixes":["BPK","WOBUN","ABBOT"]},"P44":{"fixes":["TOPPA","POL","NEXUS"]},"R1":{"fixes":["STU","BCN","EXMOR","BHD"]},"T10":{"fixes":["CLN","REDFA","SPL"]},"T256":{"fixes":["KOK","EKERN","HELEN"]},"T257":{"fixes":["HELEN","BASOP","NIK"]},"Z1":{"fixes":["BIG","KIDLI","CLN"]},"J48":{"fixes":["JFK","SBJ","LRP","HAR","JST","AIR","FWA","GIJ","BAE","DBQ","OTT"]},"J29":{"fixes":["BOS","ALB","SYR","ROC","CLE","DTW","ORD"]},"J36":{"fixes":["BOS","ALB","SYR","ROC","CLE","CVG","BNA","MEM"]},"J42":{"fixes":["MIA","MCO","JAX","CHS","CLT","GSO","RIC","DCA","PHL","EWR","JFK"]},"J64":{"fixes":["LAX","DAG","LAS","DEN","OTT","DBQ","ORD"]},"J584":{"fixes":["LAX","PMD","HEC","LAS"]},"J5":{"fixes":["LAX","SJC","SFO","EUG","PDX","SEA"]},"J501":{"fixes":["SFO","SAC","RBL","OED","EUG","BTG","SEA"]},"J70":{"fixes":["DFW","ETX","MEM","BNA","CVG","PIT","PHL"]},"J4":{"fixes":["DFW","ABQ","PHX","LAX"]},"Q32":{"fixes":["ORD","IND","BNA","ATL","JAX","MIA"]}}};
 
   // ── Navaid lookup: resolves an identifier to [lat, lon] ──
   // Priority: navaids (VOR/NDB/TACAN) → fixes → airport cache → null
@@ -1981,6 +2072,194 @@
     return null;
   }
 
+  // ── Async navaid resolver with API fallback ──
+  // Tries static NAVDATA first, then queries OpenNav API via CORS proxy
+  const _navApiCache = {};  // ident → [lat,lon] | false (not found)
+  const _navApiBatch = {};  // ident → Promise
+
+  // ── Lazy-loaded external navdata sources ──
+  // 1. GitHub CSV: 51k+ worldwide fixes (FayyazAK/Global-Aviation-Waypoints)
+  // 2. GitHub JSON: VOR/NDB/waypoints with type info (euvl/aviation-waypoints)
+  // 3. FlightPlanDatabase API: real-time lookup fallback (CORS, no key, 100/day per IP)
+  // All results are cached in localStorage for persistence across sessions.
+
+  let _extNavLoaded = false;
+  let _extNavLoading = null; // Promise while loading
+  const _fixDuplicates = {}; // ident → [{lat,lon}, ...] for ambiguous fix names
+
+  // Restore localStorage cache into _navApiCache on startup
+  try {
+    const stored = localStorage.getItem('pss_navfix_cache');
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      Object.entries(parsed).forEach(([k, v]) => {
+        if (v && Array.isArray(v) && v.length === 2) {
+          _navApiCache[k] = v;
+          // Also populate NAVDATA.fixes for resolveNavaid() sync lookups
+          if (!NAVDATA.fixes[k] && !NAVDATA.navaids[k]) {
+            NAVDATA.fixes[k] = { lat: v[0], lon: v[1], type: 'FIX' };
+          }
+        }
+      });
+      console.log('[NAV] Restored ' + Object.keys(parsed).length + ' cached fixes from localStorage');
+    }
+  } catch (e) { /* localStorage unavailable or corrupt, skip */ }
+
+  // Save _navApiCache to localStorage (debounced)
+  let _navCacheSaveTimer = null;
+  function _saveNavCache() {
+    if (_navCacheSaveTimer) clearTimeout(_navCacheSaveTimer);
+    _navCacheSaveTimer = setTimeout(() => {
+      try {
+        const toSave = {};
+        Object.entries(_navApiCache).forEach(([k, v]) => {
+          if (v && Array.isArray(v)) toSave[k] = v;
+        });
+        localStorage.setItem('pss_navfix_cache', JSON.stringify(toSave));
+      } catch (e) { /* quota exceeded or unavailable */ }
+    }, 2000);
+  }
+
+  // Load external navdata from GitHub (lazy, one-time)
+  async function _loadExternalNavdata() {
+    if (_extNavLoaded) return;
+    if (_extNavLoading) return _extNavLoading;
+    _extNavLoading = (async () => {
+      let csvCount = 0, jsonCount = 0;
+      try {
+        // Load GitHub CSV: Global Aviation Waypoints (51k fixes, ~2MB)
+        const csvResp = await fetch('https://raw.githubusercontent.com/FayyazAK/Global-Aviation-Waypoints/main/global_aviation_waypoints.csv', { signal: AbortSignal.timeout(12000) });
+        if (csvResp.ok) {
+          const text = await csvResp.text();
+          const lines = text.split('\n');
+          for (let i = 1; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line) continue;
+            // CSV has quoted country names with commas (e.g. "Korea, Republic of")
+            // Parse from the END: last field=LON, second-to-last=LAT, third-to-last=IDENT
+            const parts = line.split(',');
+            if (parts.length < 5) continue;
+            const lon = parseFloat(parts[parts.length - 1]);
+            const lat = parseFloat(parts[parts.length - 2]);
+            const ident = (parts[parts.length - 3] || '').trim().toUpperCase();
+            if (ident && ident.length >= 2 && ident.length <= 6 && !isNaN(lat) && !isNaN(lon)) {
+              if (!NAVDATA.fixes[ident] && !NAVDATA.navaids[ident]) {
+                NAVDATA.fixes[ident] = { lat, lon, type: 'FIX' };
+                csvCount++;
+              } else if (NAVDATA.fixes[ident]) {
+                // Store duplicates for geographic disambiguation
+                if (!_fixDuplicates[ident]) _fixDuplicates[ident] = [{ lat: NAVDATA.fixes[ident].lat, lon: NAVDATA.fixes[ident].lon }];
+                _fixDuplicates[ident].push({ lat, lon });
+              } else if (NAVDATA.navaids[ident]) {
+                // CSV fix matches existing navaid — store alternative for disambiguation
+                if (!_fixDuplicates[ident]) _fixDuplicates[ident] = [{ lat: NAVDATA.navaids[ident].lat, lon: NAVDATA.navaids[ident].lon }];
+                _fixDuplicates[ident].push({ lat, lon });
+              }
+            }
+          }
+          console.log('[NAV] Loaded ' + csvCount + ' fixes from GitHub CSV');
+        }
+      } catch (e) { console.warn('[NAV] GitHub CSV load failed:', e.message); }
+
+      try {
+        // Load euvl waypoints JSON (VOR/NDB with types, ~846KB)
+        const jsonResp = await fetch('https://raw.githubusercontent.com/euvl/aviation-waypoints/master/waypoints.json', { signal: AbortSignal.timeout(10000) });
+        if (jsonResp.ok) {
+          const waypoints = await jsonResp.json();
+          waypoints.forEach(w => {
+            if (!w.name || !w.coords || w.coords.length < 2) return;
+            const ident = w.name.toUpperCase().trim();
+            const lon = w.coords[0], lat = w.coords[1]; // euvl format is [lon, lat, alt]
+            if (!isNaN(lat) && !isNaN(lon)) {
+              const typeMap = { VHF: 'VOR', NDB: 'NDB', WYP: 'FIX', ARP: 'APT' };
+              const type = typeMap[w.type] || 'FIX';
+              if (type === 'VOR' || type === 'NDB') {
+                if (!NAVDATA.navaids[ident]) {
+                  NAVDATA.navaids[ident] = { lat, lon, type, name: ident };
+                  jsonCount++;
+                } else {
+                  // Store alternative VOR/NDB location for disambiguation
+                  if (!_fixDuplicates[ident]) _fixDuplicates[ident] = [{ lat: NAVDATA.navaids[ident].lat, lon: NAVDATA.navaids[ident].lon }];
+                  _fixDuplicates[ident].push({ lat, lon });
+                }
+              } else if (!NAVDATA.fixes[ident] && !NAVDATA.navaids[ident]) {
+                NAVDATA.fixes[ident] = { lat, lon, type };
+                jsonCount++;
+              } else if (NAVDATA.fixes[ident]) {
+                // Store alternative fix location for disambiguation
+                if (!_fixDuplicates[ident]) _fixDuplicates[ident] = [{ lat: NAVDATA.fixes[ident].lat, lon: NAVDATA.fixes[ident].lon }];
+                _fixDuplicates[ident].push({ lat, lon });
+              }
+            }
+          });
+          console.log('[NAV] Loaded ' + jsonCount + ' navaids from euvl JSON');
+        }
+      } catch (e) { console.warn('[NAV] euvl JSON load failed:', e.message); }
+
+      _extNavLoaded = true;
+      _extNavLoading = null;
+      console.log('[NAV] External navdata ready: ' + (csvCount + jsonCount) + ' new entries added');
+    })();
+    return _extNavLoading;
+  }
+
+  async function resolveNavaidAsync(ident) {
+    if (!ident) return null;
+    const id = ident.toUpperCase().trim();
+    // Try static first (includes restored localStorage cache)
+    const local = resolveNavaid(id);
+    if (local) return local;
+    // Check API cache (includes negatives)
+    if (id in _navApiCache) return _navApiCache[id] || null;
+    // Deduplicate concurrent requests for same ident
+    if (_navApiBatch[id]) return _navApiBatch[id];
+    _navApiBatch[id] = (async () => {
+      try {
+        // Ensure external navdata is loaded
+        await _loadExternalNavdata();
+        // Re-check after external data loaded
+        const afterExt = resolveNavaid(id);
+        if (afterExt) { _navApiCache[id] = afterExt; _saveNavCache(); return afterExt; }
+
+        // Fallback: FlightPlanDatabase API (CORS-enabled, no API key, 100 req/day per IP)
+        const url = 'https://api.flightplandatabase.com/search/nav?q=' + encodeURIComponent(id);
+        const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+        if (resp.ok) {
+          const results = await resp.json();
+          if (results && results.length > 0) {
+            const best = results[0];
+            if (best.lat != null && best.lon != null) {
+              const coords = [parseFloat(best.lat), parseFloat(best.lon)];
+              const type = best.type || 'FIX';
+              if (type === 'VOR' || type === 'NDB' || type === 'VORDME' || type === 'TACAN') {
+                if (!NAVDATA.navaids[id]) NAVDATA.navaids[id] = { lat: coords[0], lon: coords[1], type, name: best.name || id };
+              } else {
+                if (!NAVDATA.fixes[id]) NAVDATA.fixes[id] = { lat: coords[0], lon: coords[1], type };
+              }
+              // Store all alternative locations for disambiguation
+              if (results.length > 1) {
+                if (!_fixDuplicates[id]) _fixDuplicates[id] = [];
+                for (const r of results) {
+                  if (r.lat != null && r.lon != null) {
+                    _fixDuplicates[id].push({ lat: parseFloat(r.lat), lon: parseFloat(r.lon) });
+                  }
+                }
+              }
+              _navApiCache[id] = coords;
+              _saveNavCache();
+              return coords;
+            }
+          }
+        }
+      } catch (e) { /* API unavailable, skip */ }
+      _navApiCache[id] = false;
+      return null;
+    })();
+    const result = await _navApiBatch[id];
+    delete _navApiBatch[id];
+    return result;
+  }
+
   // ── Get navaid metadata for tooltip display ──
   function getNavaidInfo(ident) {
     if (!ident) return null;
@@ -1990,29 +2269,71 @@
     return null;
   }
 
-  // ── Route string parser ──
+  // ── Route string parser (async — resolves unknown waypoints via API) ──
   // Tokenizes a filed route string (e.g., "MERIT2 MERIT DCT TALLA UL612 GOW")
   // and resolves each navigable fix to a [lat, lon] coordinate.
   // Skips SID/STAR procedure names, DCT tokens, and speed/level groups.
   // Returns array of { ident, coords, info, isAirway } objects.
-  function parseRouteString(routeStr, depIcao, arrIcao) {
+  async function parseRouteString(routeStr, depIcao, arrIcao) {
     if (!routeStr || !routeStr.trim()) return [];
+
+    // Eagerly start loading external navdata (GitHub CSV + JSON)
+    // so that by the time we resolve tokens, the data is available
+    _loadExternalNavdata(); // fire-and-forget, resolveNavaidAsync will await it
 
     const tokens = routeStr.toUpperCase().trim().split(/\s+/);
     const result = [];
     const seen = new Set();
 
+    // Pre-process tokens: split on '/' to extract fix names, parse ICAO coords
+    const processed = [];
+    for (const raw of tokens) {
+      // Split speed/level annotations: JOOPY/M083F380 -> JOOPY
+      const slashIdx = raw.indexOf('/');
+      const tok = slashIdx > 0 ? raw.substring(0, slashIdx) : raw;
+      processed.push(tok);
+    }
+
+    // Pre-resolve all unknown tokens via API in parallel (batch)
+    const unknowns = [];
+    for (const tok of processed) {
+      if (tok === 'DCT' || tok === 'DIRECT') continue;
+      if (/^[NMK]\d{3,4}[FSAM]\d{3,4}$/.test(tok)) continue;
+      if (/^\d+$/.test(tok)) continue;
+      // ICAO lat/lon coordinates (e.g. 49N050W, 5530N02000W) - no need to resolve
+      if (/^\d{2,4}[NS]\d{3,5}[EW]$/.test(tok)) continue;
+      if (NAVDATA.airways[tok] != null) continue;
+      // Skip likely airway identifiers not in our dict (letter(s) + digits, e.g. L603, T104, UN871)
+      if (/^[A-Z]{1,2}\d{1,4}[A-Z]?$/.test(tok) && tok.length <= 6) continue;
+      if (!resolveNavaid(tok)) {
+        const stripped = tok.replace(/\d+[A-Z]?$/, '');
+        if (!resolveNavaid(stripped)) unknowns.push(tok);
+      }
+    }
+    // Resolve dep/arr airports via dedicated airport API (better coverage)
+    const aptPromises = [];
+    if (depIcao && !resolveNavaid(depIcao)) aptPromises.push(getAptCoords(depIcao));
+    if (arrIcao && !resolveNavaid(arrIcao)) aptPromises.push(getAptCoords(arrIcao));
+    // Batch resolve unknown navaids + airports in parallel (max 20 navaids to avoid flooding)
+    if (unknowns.length > 0) {
+      const batch = [...new Set(unknowns)].slice(0, 20);
+      await Promise.allSettled([...batch.map(id => resolveNavaidAsync(id)), ...aptPromises]);
+    } else if (aptPromises.length > 0) {
+      await Promise.allSettled(aptPromises);
+    }
+
     // Add departure airport as first point
+    // Uses getAptCoords for dual-API fallback (VATSIM airports + OpenNav)
     if (depIcao) {
-      const depCoords = resolveNavaid(depIcao);
+      const depCoords = resolveNavaid(depIcao) || await getAptCoords(depIcao);
       if (depCoords) {
         result.push({ ident: depIcao, coords: depCoords, info: { type: 'APT', name: depIcao }, isAirway: false });
         seen.add(depIcao);
       }
     }
 
-    for (let i = 0; i < tokens.length; i++) {
-      const tok = tokens[i];
+    for (let i = 0; i < processed.length; i++) {
+      const tok = processed[i];
 
       // Skip DCT (direct), speed/level groups like N0450F350 or M082F390
       if (tok === 'DCT' || tok === 'DIRECT') continue;
@@ -2020,28 +2341,44 @@
       // Skip pure numbers (flight levels filed as bare numbers)
       if (/^\d+$/.test(tok)) continue;
 
-      // Check if this is an airway identifier
+      // Parse ICAO lat/lon coordinates (e.g. 49N050W, 5530N02000W)
+      const icaoMatch = tok.match(/^(\d{2,4})([NS])(\d{3,5})([EW])$/);
+      if (icaoMatch) {
+        let lat = parseFloat(icaoMatch[1]);
+        let lon = parseFloat(icaoMatch[3]);
+        // Handle DDMM format (e.g. 5530 = 55deg 30min)
+        if (icaoMatch[1].length > 2) lat = Math.floor(lat / 100) + (lat % 100) / 60;
+        if (icaoMatch[3].length > 3) lon = Math.floor(lon / 100) + (lon % 100) / 60;
+        if (icaoMatch[2] === 'S') lat = -lat;
+        if (icaoMatch[4] === 'W') lon = -lon;
+        if (!seen.has(tok)) {
+          result.push({ ident: tok, coords: [lat, lon], info: { type: 'COORD', name: tok }, isAirway: false });
+          seen.add(tok);
+        }
+        continue;
+      }
+
+      // Check if this is a known airway identifier
       const isAirway = NAVDATA.airways[tok] != null;
+
+      // Skip likely airway identifiers not in our dictionary (e.g. L603, T104, UN871, N371B)
+      if (!isAirway && /^[A-Z]{1,2}\d{1,4}[A-Z]?$/.test(tok) && tok.length <= 6) continue;
+
       if (isAirway) {
-        // Airways connect the previous fix to the next fix in the route string.
-        // We mark the airway so the renderer can draw the segment differently.
-        // The actual fixes along the airway between entry/exit are resolved below.
         const awy = NAVDATA.airways[tok];
-        if (awy && awy.fixes && awy.fixes.length > 0 && i + 1 < tokens.length) {
-          const nextTok = tokens[i + 1];
+        if (awy && awy.fixes && awy.fixes.length > 0 && i + 1 < processed.length) {
+          const nextTok = processed[i + 1];
           const prevFix = result.length > 0 ? result[result.length - 1].ident : null;
 
-          // Find entry and exit indices in the airway fix list
           const entryIdx = prevFix ? awy.fixes.indexOf(prevFix) : -1;
           const exitIdx = awy.fixes.indexOf(nextTok);
 
           if (entryIdx >= 0 && exitIdx >= 0 && entryIdx !== exitIdx) {
-            // Add intermediate fixes along the airway
             const step = entryIdx < exitIdx ? 1 : -1;
             for (let j = entryIdx + step; j !== exitIdx; j += step) {
               const fixId = awy.fixes[j];
               if (fixId && !seen.has(fixId)) {
-                const coords = resolveNavaid(fixId);
+                const coords = resolveNavaid(fixId) || await resolveNavaidAsync(fixId);
                 if (coords) {
                   result.push({ ident: fixId, coords, info: getNavaidInfo(fixId), isAirway: true, airway: tok });
                   seen.add(fixId);
@@ -2058,11 +2395,60 @@
       let resolvedIdent = tok;
 
       if (!coords) {
-        // Try stripping trailing digit(s) — common SID/STAR naming (BUZAD3, TALLA1A)
         const stripped = tok.replace(/\d+[A-Z]?$/, '');
         if (stripped && stripped !== tok) {
           coords = resolveNavaid(stripped);
           if (coords) resolvedIdent = stripped;
+        }
+      }
+
+      // API fallback for unresolved waypoints
+      if (!coords) {
+        coords = await resolveNavaidAsync(tok);
+        if (coords) resolvedIdent = tok;
+      }
+      if (!coords) {
+        const stripped = tok.replace(/\d+[A-Z]?$/, '');
+        if (stripped && stripped !== tok) {
+          coords = await resolveNavaidAsync(stripped);
+          if (coords) resolvedIdent = stripped;
+        }
+      }
+      // Inline proximity selection: if duplicates exist, pick closest to previous waypoint
+      // (runs BEFORE safety drops so alternatives get a chance)
+      if (coords && result.length > 0 && _fixDuplicates[resolvedIdent]) {
+        const prevCoords = result[result.length - 1].coords;
+        let bestDist = haversineKm(prevCoords, coords);
+        let bestCoords = coords;
+        for (const alt of _fixDuplicates[resolvedIdent]) {
+          const altCoords = [alt.lat, alt.lon];
+          const altDist = haversineKm(prevCoords, altCoords);
+          if (altDist < bestDist) { bestDist = altDist; bestCoords = altCoords; }
+        }
+        if (bestCoords !== coords) {
+          console.log('[ROUTE] Disambiguated ' + resolvedIdent + ': picked alt ' + Math.round(bestDist) + 'km vs ' + Math.round(haversineKm(prevCoords, coords)) + 'km');
+          coords = bestCoords;
+          if (NAVDATA.navaids[resolvedIdent]) { NAVDATA.navaids[resolvedIdent].lat = coords[0]; NAVDATA.navaids[resolvedIdent].lon = coords[1]; }
+          else if (NAVDATA.fixes[resolvedIdent]) { NAVDATA.fixes[resolvedIdent].lat = coords[0]; NAVDATA.fixes[resolvedIdent].lon = coords[1]; }
+        }
+      }
+
+      // Proximity sanity check for 3-letter VOR identifiers that may be ambiguous
+      // (e.g. SPI = Spitfire UK VOR vs Springfield IL VOR)
+      // If resolved point is very far from previous, try US airport K+ident as alternative
+      if (coords && result.length > 0 && /^[A-Z]{3}$/.test(tok)) {
+        const prevC = result[result.length - 1].coords;
+        const curDist = haversineKm(prevC, coords);
+        if (curDist > 3000) {
+          // Try resolving K+ident (US ICAO airport code, co-located with VOR)
+          const kCoords = await resolveNavaidAsync('K' + tok);
+          if (kCoords && haversineKm(prevC, kCoords) < curDist) {
+            coords = kCoords; resolvedIdent = tok;
+          } else if (curDist > 4000) {
+            // K-prefix didn't help and VOR is extremely far — likely wrong continent, skip
+            console.log('[ROUTE] Dropping far VOR ' + tok + ' (' + Math.round(curDist) + 'km from prev)');
+            coords = null;
+          }
         }
       }
 
@@ -2073,10 +2459,65 @@
     }
 
     // Add arrival airport as last point
+    // Uses getAptCoords for dual-API fallback (VATSIM airports + OpenNav)
     if (arrIcao) {
-      const arrCoords = resolveNavaid(arrIcao);
+      const arrCoords = resolveNavaid(arrIcao) || await getAptCoords(arrIcao);
       if (arrCoords && !seen.has(arrIcao)) {
         result.push({ ident: arrIcao, coords: arrCoords, info: { type: 'APT', name: arrIcao }, isAirway: false });
+      }
+    }
+
+    // ── Geographic disambiguation pass ──
+    // Many 5-letter fix names exist in multiple countries. This pass:
+    // 1. Always checks duplicates for the closest match to the route corridor
+    // 2. Removes waypoints that create impossible detours
+    if (result.length >= 3) {
+      // Compute route corridor midpoint from dep/arr for global context
+      const depPt = result[0].coords;
+      const arrPt = result[result.length - 1].coords;
+      const corridorMid = [(depPt[0] + arrPt[0]) / 2, (depPt[1] + arrPt[1]) / 2];
+      const corridorLen = haversineKm(depPt, arrPt);
+      // Max reasonable distance from corridor midpoint (half route + generous buffer)
+      const corridorMaxKm = corridorLen * 0.75 + 500;
+
+      for (let i = 1; i < result.length - 1; i++) {
+        const id = result[i].ident;
+        const dupes = _fixDuplicates[id];
+        const prev = result[i - 1].coords;
+        const next = result[i + 1].coords;
+        const cur = result[i].coords;
+
+        // Always try to disambiguate if duplicates exist
+        if (dupes && dupes.length > 0) {
+          const curDetour = haversineKm(prev, cur) + haversineKm(cur, next);
+          let bestCoords = cur, bestDetour = curDetour;
+          for (const alt of dupes) {
+            const altCoords = [alt.lat, alt.lon];
+            const ad = haversineKm(prev, altCoords) + haversineKm(altCoords, next);
+            if (ad < bestDetour) { bestDetour = ad; bestCoords = altCoords; }
+          }
+          if (bestCoords !== cur) result[i].coords = bestCoords;
+        }
+
+        // After disambiguation, check if still unreasonable
+        const dPrev = haversineKm(prev, result[i].coords);
+        const dNext = haversineKm(result[i].coords, next);
+        const dDirect = haversineKm(prev, next);
+        const dFromCorridor = haversineKm(corridorMid, result[i].coords);
+
+        // Remove if waypoint creates an unreasonable detour
+        // (a) detour >3x direct AND >4000km total — likely wrong continent
+        // (b) detour >3x AND >1500km AND outside corridor — wrong location
+        // (c) extreme detour >5x AND >3000km — clearly wrong
+        const detourTotal = dPrev + dNext;
+        const detourRatio = dDirect > 0 ? detourTotal / dDirect : 999;
+        const outsideCorridor = dFromCorridor > corridorMaxKm;
+        if ((detourRatio > 3 && detourTotal > 4000) ||
+            (detourRatio > 3 && detourTotal > 1500 && outsideCorridor) ||
+            (detourRatio > 5 && detourTotal > 3000)) {
+          console.log('[ROUTE] Removing bad waypoint ' + id + ': detour ' + Math.round(detourTotal) + 'km (' + detourRatio.toFixed(1) + 'x direct)');
+          result.splice(i, 1); i--;
+        }
       }
     }
 
@@ -2205,7 +2646,7 @@
     const pos = [p.latitude, p.longitude];
 
     // Attempt to parse the route string through VOR/fix waypoints
-    const parsed = parseRouteString(fp.route, fp.departure, fp.arrival);
+    const parsed = await parseRouteString(fp.route, fp.departure, fp.arrival);
 
     if (parsed.length >= 2) {
       // Draw route through resolved waypoints
@@ -2229,12 +2670,15 @@
           const seg = haversineKm(pts[i], pts[i + 1]) > 400
             ? gcPoints(pts[i], pts[i + 1], 16)
             : [pts[i], pts[i + 1]];
-          routeLyr.addLayer(L.polyline(seg, { color, weight: 1.8, opacity: 0.5, dashArray: dash, interactive: false }));
+          routeLyr.addLayer(L.polyline(seg, { color, weight: 2.5, opacity: 0.85, dashArray: dash, interactive: false }));
         }
       };
 
-      drawSegments(flownPts, '#34d399', '4 7');
-      drawSegments(remainPts, '#22d3ee', '5 5');
+      const day = currentTheme === 'day';
+      const flownColor = day ? '#059669' : '#34d399';
+      const remainColor = day ? '#0891b2' : '#22d3ee';
+      drawSegments(flownPts, flownColor, '4 7');
+      drawSegments(remainPts, remainColor, '5 5');
 
       // Draw waypoint markers along the parsed route
       parsed.forEach((pt, idx) => {
@@ -2242,14 +2686,14 @@
         const info = pt.info || {};
         const isVOR = info.type === 'VOR' || info.type === 'VORDME' || info.type === 'TACAN';
         const isNDB = info.type === 'NDB';
-        const color = isVOR ? '#22d3ee' : isNDB ? '#fbbf24' : '#a78bfa';
-        const size = isVOR || isNDB ? 5 : 3;
+        const color = isVOR ? (day ? '#0891b2' : '#22d3ee') : isNDB ? (day ? '#d97706' : '#fbbf24') : (day ? '#7c3aed' : '#a78bfa');
+        const size = isVOR || isNDB ? 7 : 4;
 
         const icon = L.divIcon({
           className: '',
           html: `<div style="transform:translate(-50%,-50%);text-align:center;pointer-events:none">
             <div style="width:${size}px;height:${size}px;${isVOR ? 'transform:rotate(45deg);border:1px solid' : isNDB ? 'border-radius:50%;border:1px solid' : 'border-radius:1px;transform:rotate(45deg);background:'}${color};margin:0 auto"></div>
-            <div style="font-family:'SF Mono',SFMono-Regular,'IBM Plex Mono',Menlo,monospace;font-size:8px;font-weight:600;color:${color};text-shadow:${lblShadow()};margin-top:2px">${pt.ident}</div>
+            <div style="font-family:'SF Mono',SFMono-Regular,'IBM Plex Mono',Menlo,monospace;font-size:9px;font-weight:700;color:${color};text-shadow:${lblShadowLg()};margin-top:2px">${pt.ident}</div>
           </div>`,
           iconSize: [0, 0], iconAnchor: [0, 0]
         });
@@ -2261,14 +2705,17 @@
       // Fallback: original great-circle route (dep → pos → arr) when route can't be parsed
       const [depC, arrC] = await Promise.all([getAptCoords(fp.departure), getAptCoords(fp.arrival)]);
       const long = depC && arrC && haversineKm(depC, arrC) > 1200;
+      const day = currentTheme === 'day';
+      const fbFlown = day ? '#059669' : '#34d399';
+      const fbRemain = day ? '#0891b2' : '#22d3ee';
 
       if (depC) {
         const pts = long ? gcPoints(depC, pos) : [depC, pos];
-        routeLyr.addLayer(L.polyline(pts, { color: '#34d399', weight: 1.5, opacity: .4, dashArray: '4 7', interactive: false }));
+        routeLyr.addLayer(L.polyline(pts, { color: fbFlown, weight: 2.5, opacity: .75, dashArray: '4 7', interactive: false }));
       }
       if (arrC) {
         const pts = long ? gcPoints(pos, arrC) : [pos, arrC];
-        routeLyr.addLayer(L.polyline(pts, { color: '#22d3ee', weight: 1.5, opacity: .5, dashArray: '5 5', interactive: false }));
+        routeLyr.addLayer(L.polyline(pts, { color: fbRemain, weight: 2.5, opacity: .85, dashArray: '5 5', interactive: false }));
       }
     }
 
@@ -2290,13 +2737,14 @@
       }));
     };
 
-    if (depC) aptDot(depC, '#34d399', fp.departure);
-    if (arrC) aptDot(arrC, '#f87171', fp.arrival);
+    const _day = currentTheme === 'day';
+    if (depC) aptDot(depC, _day ? '#059669' : '#34d399', fp.departure);
+    if (arrC) aptDot(arrC, _day ? '#dc2626' : '#f87171', fp.arrival);
   }
 
   // ── Build parsed route HTML for the pilot drawer ──
-  function buildParsedRouteHtml(routeStr, depIcao, arrIcao) {
-    const parsed = parseRouteString(routeStr, depIcao, arrIcao);
+  async function buildParsedRouteHtml(routeStr, depIcao, arrIcao) {
+    const parsed = await parseRouteString(routeStr, depIcao, arrIcao);
     if (parsed.length < 2) return '';
 
     // Build a visual route string with color-coded waypoints
@@ -2322,25 +2770,35 @@
     </div>`;
   }
 
-  // ── AIRAC cycle display & auto-update logic ──
+  // ── AIRAC display ───────────────────────────────────────────────────────────
+  // Computes once on load, re-checks once per day. AIRAC dates are deterministic
+  // from the ICAO epoch — the schedule table above (2026-2028) is for reference
+  // and cross-check only. computeCurrentAirac() handles everything, forever.
   function initAiracDisplay() {
     const stat = document.getElementById('airacStat');
     const cycleEl = document.getElementById('airacCycle');
     if (!stat || !cycleEl) return;
-
     stat.style.display = 'flex';
-    cycleEl.textContent = NAVDATA.cycle;
-
-    // Check if data is expired
-    const expires = new Date(NAVDATA.expires);
-    const now = new Date();
-    if (now > expires) {
-      cycleEl.style.color = 'var(--red)';
-      cycleEl.title = 'AIRAC data expired — update recommended';
+    const cur = computeCurrentAirac();
+    NAVDATA.cycle = cur.cycle; NAVDATA.effective = cur.effective; NAVDATA.expires = cur.expires;
+    cycleEl.textContent = cur.cycle;
+    const expires = new Date(cur.expires + 'T23:59:59Z');
+    if (new Date() > expires) {
+      cycleEl.style.color = 'var(--red)'; cycleEl.title = 'AIRAC expired';
     } else {
       cycleEl.style.color = 'var(--grn)';
-      cycleEl.title = `Valid until ${NAVDATA.expires}`;
+      cycleEl.title = 'AIRAC ' + cur.cycle + ' \u00B7 valid ' + cur.effective + ' \u2192 ' + cur.expires;
     }
+    // Re-check once per day (cycle changes every 28 days; daily is plenty)
+    setInterval(function() {
+      const c = computeCurrentAirac();
+      if (c.cycle !== NAVDATA.cycle) {
+        NAVDATA.cycle = c.cycle; NAVDATA.effective = c.effective; NAVDATA.expires = c.expires;
+        cycleEl.textContent = c.cycle;
+        cycleEl.style.color = 'var(--grn)';
+        cycleEl.title = 'AIRAC ' + c.cycle + ' \u00B7 valid ' + c.effective + ' \u2192 ' + c.expires;
+      }
+    }, 86400000);
   }
 
 
@@ -2543,6 +3001,27 @@
         updateMap();
         if(showFIR) updateFIR();
         if(doSigmet){ _lastSigmetFetch = now; updateSIGMETs(); }
+
+        // ── Reactive route update for selected pilot ──
+        // Re-render route on every poll so aircraft position updates along the route.
+        // If route string changed (pilot amended flight plan), re-parse from scratch.
+        if(selPilot){
+          const allP = getAllPilots();
+          const updated = allP.find(pp => pp.callsign === selPilot.callsign);
+          if(updated){
+            selPilot = updated; // refresh with latest position/data
+            const newRoute = (updated.flight_plan||{}).route||'';
+            if(newRoute !== _selRouteStr){
+              // Route string changed — pilot amended flight plan. Re-parse & re-render.
+              console.log('[ROUTE] Flight plan changed for ' + updated.callsign + ', re-parsing route');
+              _selRouteStr = newRoute;
+              showRouteParsed(updated); // async, fire-and-forget for poll cycle
+            } else {
+              // Same route, just update aircraft position along the route
+              showRouteParsed(updated);
+            }
+          }
+        }
       }
       firstDataLoaded=true;
       hideLoader();
@@ -2670,17 +3149,17 @@
     if(!typeCode) return 'medium';
     const t=(typeCode+'').toUpperCase().replace(/[^A-Z0-9]/g,'');
     // Helicopters: Robinson, Bell, Airbus/Eurocopter, Sikorsky, AgustaWestland/Leonardo, MD, Mil, Kamov, etc.
-    if(/^(R22|R44|R66|B06|B47|B05|B06T|B07|B0[5-9]|B2[01][24]|B4[012][29]|EC[0-9]|EC[12][0-9]|EC[13][35]|EC[14]5|AS[0-9]|AS3[0-9]|A109|A119|A139|A149|A169|A189|AW[0-9]|AW1[0-9]|S55|S58|S61|S64|S70|S76|S92|UH1|UH60|AH6|AH64|CH47|CH53|MD5|MD6|MD90[0-9]|BK17|H269|H500|H60|BO10|KA[0-9]|KA2[26]|KA3[12]|MI[0-9]|MI[12][0-9]|MI[234][0-9]|SA3[1-6]|NH90|LAMA|PUMA|LYNX|GAZE|HUCO|CABR|FH11|EN28|G2CA|EXPL)/.test(t)) return 'helicopter';
-    // Heavy: wide-bodys & large aircraft (B777, A380, etc)
-    if(/^(B74|B75|B76|B77|B78|B74F|A38|A34|A35|A33|B748|B744|B763|B764|B77[WL]|AN1|C5A|C17|IL9|MD1|MD9)/.test(t)) return 'heavy';
+    if(/^(R22|R44|R66|B06|B47|B05|B06T|B07|B0[5-9]|B2[01][24]|B4[012][29]|EC[0-9]|EC[12][0-9]|EC[13][35]|EC[14]5|AS[0-9]|AS3[0-9]|A109|A119|A139|A149|A169|A189|AW[0-9]|AW1[0-9]|S55|S58|S61|S64|S70|S76|S92|UH1|UH60|AH6|AH64|CH47|CH53|MD5|MD6|MD90[0-9]|BK17|H269|H500|H60|BO10|KA[0-9]|KA2[26]|KA3[12]|MI[0-9]|MI[12][0-9]|MI[234][0-9]|SA3[1-6]|NH90|LAMA|PUMA|LYNX|GAZE|HUCO|CABR|FH11|EN28|G2CA|EXPL|W3|SW4|K32|H135|H145|H155|H160|H175|H215|H225|EC35|EC45|EC55|EC75|SK58|SK61|SK76|SK92|AB13|AB21|AB41|AB43)/.test(t)) return 'helicopter';
+    // Heavy: wide-body & large aircraft (B777, A380, B747, A340, A330, B787, A350, etc.)
+    if(/^(B74|B75|B76|B77|B78|B74F|A38|A34|A35|A33|B748|B744|B763|B764|B77[WL]|AN1|AN2|C5A|C5M|C17|IL9|IL7|IL6|MD1|MD9|DC10|DC8|A3ST|A310|A306|A332|A333|A339|A342|A343|A345|A346|A359|A35K|A388|B741|B742|B743|B744|B748|B752|B753|B762|B763|B764|B772|B77L|B77W|B788|B789|B78X|IL76|IL86|IL96|T204|T214|T154|AN12|AN22|AN24|AN72|AN74|AN38|C130|C135|KC10|KC35|KC46|L101|CONC|TU14|TU95)/.test(t)) return 'heavy';
     // Light jets: VLJ, light & mid-size business jets, bizjets
-    if(/^(C25[0-9AB]|C50|C51|C52|C55|C56|C68|C70|CL[36][0-9]|LJ[2-7][05]|LJ[0-9]|H25|HA4T|HDJT|E50P|E55P|EA50|SF50|PC24|PRM1|GALX|GL5T|GL7T|GLF[2-6]|GLEX|G[12][0-9][0-9]|G280|G[345][0-9][0-9]|FA[257][0-9X]|F2TH|F900|BE4[0-9]|MU30|ASTR)/.test(t)) return 'lightjet';
-    // Regional: turboprops & regional jets (CRJ, ATR, ERJ, etc)
-    if(/^(AT[457]|DH[18C]|E1[07][05]|E[12][0-9][05]|CRJ|SF34|JS41|BE19|J3[12]|P180|DHC[68]|PC12|TBM|SR[23]|DA[34]|C17[23]|B350)/.test(t)) return 'regional';
+    if(/^(C25[0-9AB]|C50|C51|C52|C55|C56|C68|C70|CL[36][0-9]|LJ[2-7][05]|LJ[0-9]|H25|HA4T|HDJT|E50P|E55P|EA50|SF50|PC24|PRM1|GALX|GL5T|GL7T|GLF[2-6]|GLEX|G[12][0-9][0-9]|G280|G[345][0-9][0-9]|FA[257][0-9X]|F2TH|F900|BE4[0-9]|MU30|ASTR|BD70|JCOM|EVOT|E35L|E545|E55P|C510|C525|C526|C528|C550|C560|C680|C700|C750|CL30|CL35|CL60|CL61|CL64|HDJT|PRM1|LJ23|LJ24|LJ25|LJ28|LJ31|LJ35|LJ40|LJ45|LJ55|LJ60|LJ70|LJ75|GLF3|GLF4|GLF5|GLF6|G100|G150|G200|G250|G350|G450|G500|G550|G600|G650|G700|G800|FA50|FA7X|FA8X|FA10|FA20|FA30|DA62|BE40|ASSY|E135|E145|E170|E190|E195|E290|E295|TRIS|SJ30|ISBA|AJET)/.test(t)) return 'lightjet';
+    // Regional: turboprops & regional jets (CRJ, ATR, ERJ, E-Jets, Dash 8, etc.)
+    if(/^(AT[457]|DH[18C]|E1[07][05]|E[12][0-9][05]|CRJ[1-9]|CRJ|SF34|JS[234]|BE19|J3[12]|P180|DHC[68]|PC12|TBM[0-9]|SR[23]|DA[34]|C17[23]|B350|IL14|IL18|AN26|AN28|AN32|AN14|L410|SB20|SW[34]|F27|F50|F[67]0|D228|D328|E120|E170|E175|E190|E195|E290|E295|BCS[13]|CS[13]00|A21N|A20N|A19N|B38M|B39M|B37M|DH8[ABCD]|D8[ABCD]|DH[38]|FK[257]0|HS74|S76A|YK40|YK42|AN24|AN26|AN14|MA60|ARJ2|CN35|DO28|ATP|J31|J32|J41|B190|B200|BE99|BE18|B300|B350|SW[34]|MU2|C130|C160|E110|EMB1)/.test(t)) return 'regional';
     // GA: cessnas, piper, experimentals, light singles & piston twins
-    if(/^(C1[5-9][02458]|C2[0-9]|C3[0-9]|PA[234]|BE[235]|B60|C17[0-3]|P28|C152|C172|C182|EA[0-9]|RV[0-9]|VANS|M20|AA[0-9]|DR[0-9]|DV20|TB[0-9]|COL[34]|VENT|PIPA|CIRR)/.test(t)) return 'ga';
-    // Military: fighters, bombers, transport
-    if(/^(F[01][4-8]|F2[0-2]|MIG|SU[0-9]|B1|B2|B52|A10|F117|EF1|EURO|TXCAS|PC21|L39|L159|BAE1|JA37|AJS3)/.test(t)) return 'military';
+    if(/^(C1[5-9][02458]|C2[0-9]|C3[0-9]|PA[234]|BE[235]|B60|C17[0-3]|P28|C152|C172|C182|C206|C208|C210|C310|C337|C340|C402|C404|C414|C421|EA[0-9]|RV[0-9]|VANS|M20|AA[0-9]|DR[0-9]|DV20|TB[0-9]|COL[34]|VENT|PIPA|CIRR|SR20|SR22|SR2[012T]|DA20|DA40|DA42|DA50|DA62|SIRA|COLT|CHER|WARR|LANC|ARRC|ARCH|TOBA|TAMP|SEMP|SENE|NAVA|SRAT|CHRC|SL36|CHEE|KODI|GA8|SGUP|ECHO|EVSS|JABI|DIMO|MCR[14]|ELST|CRUZ|C82|C85|C90|PA11|PA16|PA17|PA18|PA20|PA22|PA24|PA25|PA28|PA30|PA31|PA32|PA34|PA38|PA44|PA46|PA60|BE33|BE35|BE36|BE55|BE58|BE60|BE76|BE95|M200|M20[BCEJKRST]|TEX2|AC50|AC68|AC80|AC90|AC11|AC12|ULAC|SABA|BL17|BL8|VENT|GLS[A-Z]|HU[0-9]|MAL[0-9]|GA[0-9]|PIEL|DEXT|EV97|Z[234]4[02]|ERCO|YAK[0-9]|AN2|AE45|L[48]|TIGR|ALON|GRUM|CHRN|AERO|P149|P208|REVU|RALL|ROBI|TAI|TAMP|TOBG|LEG2|LEOP)/.test(t)) return 'ga';
+    // Military: fighters, bombers, transport, tankers, trainers
+    if(/^(F[01][4-8]|F2[0-2]|F35|MIG|SU[0-9]|B1|B2|B52|A10|F117|EF1|EURO|TXCAS|PC21|L39|L159|BAE1|JA37|AJS3|F4|F5|F14|F15|F16|F18|F22|F35[ABC]|F104|F111|MIRF|MIR[0-9]|SU2[4-7]|SU3[0-9]|TU16|TU22|TU95|TU16|B1B|B2A|B52H|A4|A6|A7|AV8|E2C|E3A|E6B|P3C|P8A|C2A|C130|C17A|KC10|KC35|KC46|HAWK|E3CF|E3TF|T6|T38|T45|PC7|PC9|PC21|TUCA|ALPH|JPRO|GROB|M346|T346|T50|TA50|T4|RAFALE|RAF[ABCM]|TPHN|TYP[HN]|GRPN|TORD|VIGIL|VIGE|JAGU|HARR|LIGH|STRI|SUPE|BUCA|V22)/.test(t)) return 'military';
     return 'medium';
   }
 
@@ -2856,6 +3335,9 @@
       pilots=pilots.filter((_,i)=>i%step===0);
     }
 
+    // When a pilot is selected, fade all other aircraft to reduce clutter
+    const hasSel = !!selPilot;
+
     pilots.forEach(p=>{
       if(!p.latitude||!p.longitude) return;
       const sel=selPilot && selPilot.callsign===p.callsign;
@@ -2863,7 +3345,8 @@
       const typeCode=fp.aircraft_short||fp.aircraft||'';
       const net=p._network||'VATSIM';
       const m=L.marker([p.latitude,p.longitude],{
-        icon:acSVG(p.heading,p.groundspeed,p.altitude,sel,typeCode,p.transponder)
+        icon:acSVG(p.heading,p.groundspeed,p.altitude,sel,typeCode,p.transponder),
+        opacity: hasSel && !sel ? 0.3 : 1.0
       });
 
       // ── Hover tooltip ──
@@ -2884,7 +3367,7 @@
       );
 
       m._pssCallsign = p.callsign; // tag for interpolation engine
-      m.on('click',()=>{ selPilot=p; openPilotDrawer(p); showRouteParsed(p); updateMap(); });
+      m.on('click',async()=>{ selPilot=p; _selRouteStr=(p.flight_plan||{}).route||''; updateMap(); await openPilotDrawer(p); await showRouteParsed(p); });
       pilotsLyr.addLayer(m);
     });
 
@@ -2956,6 +3439,7 @@
     document.getElementById('infoDrawer').classList.remove('open');
     adjustControlsForDrawer(false);
     selPilot = null;
+    _selRouteStr = null;
     currentAtcData = null;
     if(atisTTS) atisTTS.stop(); // stop ATIS voice on drawer close
     if(routeLyr) routeLyr.clearLayers();
@@ -2963,7 +3447,7 @@
   }
 
   // Build bottom drawer for selected pilot — shows route, live data, & remarks tabs
-  function openPilotDrawer(p){
+  async function openPilotDrawer(p){
     const fp = p.flight_plan || {};
     const ab = altBand(p.altitude);
     // Get pilot rating lookup
@@ -3022,7 +3506,7 @@
       </div>`;
 
     // Build parsed route visualization (VOR-to-VOR with color-coded fixes)
-    const parsedRouteViz = fp.route ? buildParsedRouteHtml(fp.route, fp.departure, fp.arrival) : '';
+    const parsedRouteViz = fp.route ? await buildParsedRouteHtml(fp.route, fp.departure, fp.arrival) : '';
 
     const remarksHtml = fp.remarks
       ? `<div class="idr-remarks">${esc(fp.remarks)}</div>
@@ -3451,19 +3935,78 @@
   }
 
   // ═══ FLIGHT ROUTE LINE ═══
+  // ── OurAirports data loader (lazy, ~10k ICAO airports) ──
+  let _aptDataLoaded = false, _aptDataLoading = null;
+  async function _loadAirportData() {
+    if (_aptDataLoaded) return;
+    if (_aptDataLoading) return _aptDataLoading;
+    _aptDataLoading = (async () => {
+      try {
+        const resp = await fetch('https://raw.githubusercontent.com/davidmegginson/ourairports-data/main/airports.csv', { signal: AbortSignal.timeout(15000) });
+        if (resp.ok) {
+          const text = await resp.text();
+          const lines = text.split('\n');
+          let count = 0;
+          for (let i = 1; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line) continue;
+            // Fast parse: "id","ident","type","name","latitude_deg","longitude_deg",...
+            // Only care about ident (col 1), latitude (col 4), longitude (col 5), icao_code (col 12)
+            const parts = line.split(',');
+            if (parts.length < 6) continue;
+            const ident = (parts[1] || '').replace(/"/g, '').trim();
+            const icao = (parts[12] || '').replace(/"/g, '').trim();
+            const code = icao || ident;
+            if (!code || code.length !== 4 || !/^[A-Z]/.test(code)) continue;
+            const lat = parseFloat((parts[4] || '').replace(/"/g, ''));
+            const lon = parseFloat((parts[5] || '').replace(/"/g, ''));
+            if (!isNaN(lat) && !isNaN(lon) && !APT[code] && !aptCache[code]) {
+              aptCache[code] = [lat, lon];
+              count++;
+            }
+          }
+          console.log('[APT] Loaded ' + count + ' airports from OurAirports');
+        }
+      } catch (e) { console.warn('[APT] OurAirports load failed:', e.message); }
+      _aptDataLoaded = true;
+      _aptDataLoading = null;
+    })();
+    return _aptDataLoading;
+  }
+
   async function getAptCoords(icao){
     if(!icao||icao.length<3) return null;
     if(APT[icao]) return APT[icao];
     if(aptCache[icao]) return aptCache[icao];
     if(aptCache[icao]===false) return null;
+    // Check navdata (airports from external sources may be stored as fixes/navaids)
+    const navCoords = resolveNavaid(icao);
+    if (navCoords) { aptCache[icao] = navCoords; return navCoords; }
+    // Try OurAirports data (comprehensive, ~10k airports, loaded lazily)
+    await _loadAirportData();
+    if (aptCache[icao]) return aptCache[icao];
+    // Try VATSIM airport API (direct — VATSIM sends CORS headers)
     try{
-      const r=await pfetch(`https://api.vatsim.net/api/airports/?search=${encodeURIComponent(icao)}&limit=5`);
-      if(!r.ok) throw 0;
-      const d=await r.json();
-      const a=(d.results||[]).find(x=>x.icao===icao);
-      if(a?.latitude!=null&&a?.longitude!=null){
-        aptCache[icao]=[parseFloat(a.latitude),parseFloat(a.longitude)];
-        return aptCache[icao];
+      const r=await pfetch(`https://api.vatsim.net/api/airports/?search=${icao}&limit=5`);
+      if(r.ok){
+        const d=await r.json();
+        const a=(d.results||[]).find(x=>x.icao===icao);
+        if(a?.latitude!=null&&a?.longitude!=null){
+          aptCache[icao]=[parseFloat(a.latitude),parseFloat(a.longitude)];
+          return aptCache[icao];
+        }
+      }
+    }catch(e){}
+    // Fallback: OpenNav airport search (via CORS proxy — OpenNav has no CORS headers)
+    try{
+      const r2=await pfetch(CORS_PROXY+encodeURIComponent(`https://opennav.com/api/search?q=${icao}`));
+      if(r2.ok){
+        const d2=await r2.json();
+        const apt=Array.isArray(d2)?d2.find(x=>x.ident===icao||x.icao===icao):null;
+        if(apt?.latitude!=null&&apt?.longitude!=null){
+          aptCache[icao]=[parseFloat(apt.latitude),parseFloat(apt.longitude)];
+          return aptCache[icao];
+        }
       }
     }catch(e){}
     aptCache[icao]=false;
@@ -3504,13 +4047,15 @@
     const pos=[p.latitude,p.longitude];
     const long=depC&&arrC && haversineKm(depC,arrC)>1200; // use great-circle for >1200km
 
+    const _d=currentTheme==='day';
+    const _fc=_d?'#059669':'#34d399', _rc=_d?'#0891b2':'#22d3ee';
     if(depC){
       const pts=long ? gcPoints(depC,pos) : [depC,pos];
-      routeLyr.addLayer(L.polyline(pts,{color:'#34d399',weight:1.5,opacity:.4,dashArray:'4 7',interactive:false}));
+      routeLyr.addLayer(L.polyline(pts,{color:_fc,weight:2.5,opacity:.75,dashArray:'4 7',interactive:false}));
     }
     if(arrC){
       const pts=long ? gcPoints(pos,arrC) : [pos,arrC];
-      routeLyr.addLayer(L.polyline(pts,{color:'#22d3ee',weight:1.5,opacity:.5,dashArray:'5 5',interactive:false}));
+      routeLyr.addLayer(L.polyline(pts,{color:_rc,weight:2.5,opacity:.85,dashArray:'5 5',interactive:false}));
     }
 
     const aptDot=(coords,color,label)=>{
@@ -3527,8 +4072,8 @@
       }));
     };
 
-    if(depC) aptDot(depC,'#34d399',fp.departure);
-    if(arrC) aptDot(arrC,'#f87171',fp.arrival);
+    if(depC) aptDot(depC,_d?'#059669':'#34d399',fp.departure);
+    if(arrC) aptDot(arrC,_d?'#dc2626':'#f87171',fp.arrival);
   }
 
   // ═══ SPEED VECTORS ══════════════════════════════════════════════════════════
@@ -3622,7 +4167,7 @@
     try{
       // Primary: GeoJSON endpoint (returns Feature collection)
       const r=await pfetch(
-        'https://aviationweather.gov/api/data/sigmet?hazard=ALL&format=geojson',
+        CORS_PROXY+encodeURIComponent('https://aviationweather.gov/api/data/sigmet?hazard=ALL&format=geojson'),
         {cache:'no-store'}
       );
       if(!r.ok) throw new Error('SIGMET '+r.status);
@@ -3735,7 +4280,7 @@
   async function fetchNOAAMetars(){
     try{
       const r=await pfetch(
-        'https://aviationweather.gov/api/data/metar?bbox=-180,-90,180,90&format=json&hours=2',
+        CORS_PROXY+encodeURIComponent('https://aviationweather.gov/api/data/metar?bbox=-180,-90,180,90&format=json&hours=2'),
         {cache:'no-store'}
       );
       if(!r.ok) throw new Error('AWC '+r.status);
@@ -3748,7 +4293,7 @@
     // ── FAILSAFE 1: NOAA METAR via alternative endpoint ──────────────────
     try{
       const r=await pfetch(
-        'https://aviationweather.gov/cgi-bin/data/metar.php?dataType=METAR&requestType=retrieve&format=csv&hoursBeforeNow=2&mostRecent=false&mostRecentForEachStation=constraint&minDeg=-90&maxDeg=90&minLon=-180&maxLon=180&fields=icaoId,lat,lon,temp,dewp,wdir,wspd,wgst,visib,altim,wxString,rawOb,fltcat,clouds',
+        CORS_PROXY+encodeURIComponent('https://aviationweather.gov/cgi-bin/data/metar.php?dataType=METAR&requestType=retrieve&format=csv&hoursBeforeNow=2&mostRecent=false&mostRecentForEachStation=constraint&minDeg=-90&maxDeg=90&minLon=-180&maxLon=180&fields=icaoId,lat,lon,temp,dewp,wdir,wspd,wgst,visib,altim,wxString,rawOb,fltcat,clouds'),
         {cache:'no-store'}
       );
       if(!r.ok) throw new Error('AWC-CSV '+r.status);
@@ -3768,7 +4313,7 @@
         obj.dewp=parseFloat(obj.dewp)||null;
         obj.altim=parseFloat(obj.altim)||null;
         return obj;
-      }).filter(m=>m.lat&&m.lon);
+      }).filter(m=>m.lat!=null&&m.lon!=null&&!isNaN(m.lat)&&!isNaN(m.lon));
     }catch(e){
       console.warn('[WX] NOAA METAR (failsafe) failed:',e);
       return [];
@@ -4041,6 +4586,7 @@
             setTimeout(()=>{
               map.setView([pilot.latitude,pilot.longitude],8,{animate:true});
               selPilot=pilot;
+              _selRouteStr=(pilot.flight_plan||{}).route||'';
               updateMap();
             },150);
           }
@@ -4158,6 +4704,7 @@
         const pilot=getAllPilots().find(x=>x.callsign===cs);
         if(pilot&&pilot.latitude&&pilot.longitude){
           selPilot=pilot;
+          _selRouteStr=(pilot.flight_plan||{}).route||'';
           map.setView([pilot.latitude,pilot.longitude],8,{animate:true});
           updateMap();
           return;
@@ -4180,7 +4727,7 @@
     // Reset clears selection & returns to default view
     document.getElementById('zReset').addEventListener('click',()=>{
       if(!map) return;
-      selPilot=null;
+      selPilot=null; _selRouteStr=null;
       map.setView([36.165,-53.855],3,{animate:true});
       updateMap();
       forceResize();
@@ -4212,11 +4759,28 @@
   const app   = document.getElementById('app');
   if(!guard || !app) return;
 
-  // Click overlay → activate map (add 'active' class, hides overlay)
-  guard.addEventListener('click', ()=>{ guard.classList.add('active'); });
+  let _guardTimer = null;
+  let _cursorOverApp = false;
 
-  // Mouse leaves widget → reset guard so parent page scrolls normally again
-  app.addEventListener('mouseleave', ()=>{ guard.classList.remove('active'); });
+  // Click overlay → activate map (add 'active' class, hides overlay)
+  guard.addEventListener('click', ()=>{
+    if(_guardTimer){ clearTimeout(_guardTimer); _guardTimer=null; }
+    guard.classList.add('active');
+  });
+
+  // Track cursor position over app
+  app.addEventListener('mouseenter', ()=>{ _cursorOverApp=true; if(_guardTimer){ clearTimeout(_guardTimer); _guardTimer=null; } });
+
+  // Mouse leaves widget → 3s delay before re-showing scroll guard
+  // Only re-shows if cursor is still outside the iframe after the delay
+  app.addEventListener('mouseleave', ()=>{
+    _cursorOverApp=false;
+    if(_guardTimer) clearTimeout(_guardTimer);
+    _guardTimer = setTimeout(()=>{
+      if(!_cursorOverApp) guard.classList.remove('active');
+      _guardTimer=null;
+    }, 3000);
+  });
 
   // Touch devices: first tap activates map, then normal interactions work
   guard.addEventListener('touchstart', (e)=>{
